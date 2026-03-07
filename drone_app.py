@@ -1,601 +1,635 @@
-import fbx
 import sys
+import os
 import csv
 import numpy as np
-import pandas as pd
+import traceback
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                             QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog, 
+                             QGroupBox, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox, QSplitter,
+                             QTabWidget, QListWidget, QListWidgetItem, QAbstractItemView)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.figure import Figure
 from scipy.spatial import cKDTree
-from scipy.spatial.distance import pdist
-from scipy.sparse import csr_matrix
-from scipy.sparse.csgraph import connected_components
-import texture_sampler  # 确保这个文件在同目录下
 
-# ==========================================
-# 模块 1: 数据提取 (DataExtractor)
-# ==========================================
-class DataExtractor:
-    def __init__(self):
-        # 初始化数据容器
-        self.all_x = []
-        self.all_y = []
-        self.all_z = []
-        self.all_c = []
-        self.all_mesh_names = []
-        self.all_vertex_ids = []
+import drone_core
+import drone_composition 
+import safety_analyzer 
 
-    def run(self, input_file, scale):
-        """
-        执行全量数据提取的主入口
-        """
-        # 每次运行前清空数据
-        self.__init__()
-        
-        # 初始化 FBX 管理器
-        manager = fbx.FbxManager.Create()
-        scene = fbx.FbxScene.Create(manager, "Scene")
-        importer = fbx.FbxImporter.Create(manager, "")
+# =========================================================================
+# 导出线程
+# =========================================================================
+class ExportWorker(QThread):
+    finished = pyqtSignal(bool, str, str, dict) 
 
-        # 加载文件
-        if not importer.Initialize(input_file, -1, manager.GetIOSettings()):
-            return False, f"错误: 无法打开文件 {input_file}"
-        
-        importer.Import(scene)
-        importer.Destroy()
+    def __init__(self, exporter, optimizer_traj, fbx_path, anim_idx, fps, scale, axis, output_path, safe_dist, max_vel, L, W, H, time_scale, loop_count):
+        super().__init__()
+        self.exporter = exporter
+        self.optimizer_traj = optimizer_traj
+        self.fbx_path = fbx_path
+        self.anim_idx = anim_idx
+        self.fps = fps
+        self.scale = scale
+        self.axis = axis
+        self.output_path = output_path
+        self.safe_dist = safe_dist
+        self.max_vel = max_vel
+        self.L = L; self.W = W; self.H = H
+        self.time_scale = time_scale
+        self.loop_count = loop_count 
 
-        # 开始遍历场景图
-        root = scene.GetRootNode()
-        if root:
-            self._process_node(root, scale)
-
-        manager.Destroy()
-
-        # 检查提取结果
-        if len(self.all_x) == 0:
-            return False, "未提取到任何顶点数据，请检查模型格式。"
-
-        # 整合数据为 Numpy 数组
-        points = np.column_stack((self.all_x, self.all_y, self.all_z))
-        colors = np.array(self.all_c)
-        mesh_names = np.array(self.all_mesh_names)
-        vertex_ids = np.array(self.all_vertex_ids)
-
-        # 保存为中间文件
-        np.savez("model_data.npz", 
-                 points=points, 
-                 colors=colors, 
-                 mesh_names=mesh_names, 
-                 vertex_ids=vertex_ids)
-        
-        return True, f"提取完成！共提取 {len(self.all_x)} 个点，已保存至 model_data.npz。"
-
-    def _process_node(self, node, scale):
-        """递归遍历节点树"""
-        attr = node.GetNodeAttribute()
-        if attr and attr.GetAttributeType() == fbx.FbxNodeAttribute.EType.eMesh:
-            self._extract_mesh_data(node, scale)
-        
-        for i in range(node.GetChildCount()):
-            self._process_node(node.GetChild(i), scale)
-
-    def _extract_mesh_data(self, node, scale):
-        """提取单个 Mesh 的几何与颜色信息"""
-        mesh = node.GetMesh()
-        num_verts = mesh.GetControlPointsCount()
-        mesh_name = node.GetName()
-        
-        # 1. 优先尝试读取贴图颜色 (通过 texture_sampler)
-        colors = texture_sampler.get_texture_colors(mesh, node, base_path=".") 
-        
-        # 2. 如果没找到贴图，回退到属性读取 (顶点色/材质色)
-        if colors is None:
-            colors = self._get_vertex_colors(mesh, node)
-        
-        local_vertices = mesh.GetControlPoints()
-        
-        # 获取 t=0 时刻的全局变换矩阵
-        time_zero = fbx.FbxTime(0)
-        global_transform = node.EvaluateGlobalTransform(time_zero)
-        
-        for v_idx in range(num_verts):
-            local_pos = local_vertices[v_idx]
-            # 坐标变换：局部 -> 世界
-            final_pos = global_transform.MultT(local_pos)
-            
-            self.all_x.append(final_pos[0] * scale)
-            self.all_y.append(final_pos[1] * scale)
-            self.all_z.append(final_pos[2] * scale)
-            self.all_c.append(colors[v_idx])
-            
-            # 记录身份信息
-            self.all_mesh_names.append(mesh_name)
-            self.all_vertex_ids.append(v_idx)
-
-    def _get_vertex_colors(self, mesh, node):
-        """备用颜色获取逻辑"""
-        num_verts = mesh.GetControlPointsCount()
-        default_color = (0.5, 0.5, 0.5) 
-        final_colors = [default_color] * num_verts 
-        
-        # 尝试顶点色
-        vertex_color_layer = mesh.GetElementVertexColor(0)
-        if vertex_color_layer:
-            direct_array = vertex_color_layer.GetDirectArray()
-            if direct_array.GetCount() > 0:
-                for i in range(num_verts):
-                    idx = i if i < direct_array.GetCount() else 0
-                    c = direct_array.GetAt(idx)
-                    final_colors[i] = (c[0], c[1], c[2])
-                return final_colors
-        
-        return final_colors
-
-# ==========================================
-# 模块 2: 编队优化 (FormationOptimizer)
-# ==========================================
-class FormationOptimizer:
-    def run(self, axis_mode, target_count, safety_distance):
-        """
-        执行编队优化：去噪 -> 采样 -> 补漏
-        """
+    def run(self):
         try:
-            # 1. 加载并修正坐标轴
-            pts, cols, nms, ids = self._load_and_fix_data("model_data.npz", axis_mode)
-            if len(pts) == 0: 
-                return False, "加载 model_data.npz 失败，请先执行提取步骤。", None, None
-
-            # 2. 连通域去噪
-            cln_pts, cln_cols, cln_nms, cln_ids = self._remove_noise_artifacts(pts, cols, nms, ids, 3.0)
-            
-            # 3. 自适应体素采样 (核心筛选)
-            opt_pts, opt_cols, opt_nms, opt_ids = self._optimize_for_drone_count(cln_pts, cln_cols, cln_nms, cln_ids, target_count)
-            
-            # 4. 最终补漏与检查
-            fin_pts, fin_cols, fin_nms, fin_ids = self._finalize_drone_layout(
-                opt_pts, opt_cols, opt_nms, opt_ids,
-                cln_pts, cln_cols, cln_nms, cln_ids,
-                target_count, safety_distance
+            temp_raw_path = "temp_raw_export.csv"
+            success, msg = self.exporter.run_raw_export(
+                self.fbx_path, self.anim_idx, self.fps, self.scale, self.axis, temp_raw_path
             )
-
-            # 保存最终结果到 final_formation.npz
-            np.savez("final_formation.npz", 
-                     mesh_names=fin_nms, 
-                     vertex_ids=fin_ids,
-                     ref_points=fin_pts, 
-                     ref_colors=fin_cols)
             
-            return True, f"优化完成，最终点数: {len(fin_pts)} (目标: {target_count})", fin_pts, fin_cols
+            if not success:
+                self.finished.emit(False, f"导出失败: {msg}", "", {})
+                return
+
+            trim_success, trim_msg = self.optimizer_traj.smart_trim_and_loop(
+                temp_raw_path, self.output_path, self.loop_count
+            )
+            
+            if not trim_success:
+                self.finished.emit(False, f"裁剪失败: {trim_msg}", "", {})
+                return
+
+            opt_success, opt_msg, final_path, info = self.optimizer_traj.optimize_trajectory(
+                self.output_path, self.safe_dist, self.max_vel, self.L, self.W, self.H, self.time_scale
+            )
+            
+            if os.path.exists(temp_raw_path):
+                os.remove(temp_raw_path)
+            
+            final_msg = f"{trim_msg}\n----------------\n{opt_msg}"
+            self.finished.emit(opt_success, final_msg, final_path, info)
             
         except Exception as e:
-            return False, f"优化过程中出错: {str(e)}", None, None
+            traceback.print_exc()
+            self.finished.emit(False, f"流程异常: {str(e)}", "", {})
 
-    def _load_and_fix_data(self, file_path, mode):
+# =========================================================================
+# 静态阵列计算线程
+# =========================================================================
+class OptimizationWorker(QThread):
+    finished = pyqtSignal(bool, str, object, object)
+
+    def __init__(self, optimizer, axis_mode, count, safe_dist):
+        super().__init__()
+        self.optimizer = optimizer
+        self.axis_mode = axis_mode
+        self.count = count
+        self.safe_dist = safe_dist
+
+    def run(self):
         try:
-            data = np.load(file_path)
-            points = data['points']
-            colors = data['colors']
-            names = data['mesh_names']
-            ids = data['vertex_ids']
-            
-            # 详细的坐标轴变换逻辑
-            if mode == 1: 
-                points = points[:, [0, 2, 1]] # Y/Z 互换
-            elif mode == 2: 
-                points = points[:, [2, 1, 0]] # X/Z 互换
-            elif mode == 3: 
-                points = points[:, [1, 0, 2]] # X/Y 互换
-            elif mode == 4: 
-                # 绕 X 轴旋转 90 度
-                points[:, 1], points[:, 2] = points[:, 2].copy(), -points[:, 1].copy()
-                
-            # 归一化处理
-            min_b = points.min(axis=0)
-            max_b = points.max(axis=0)
-            scale = np.max(max_b - min_b)
-            if scale > 0: 
-                points = (points - min_b) / scale * 50.0 
-            
-            return points, colors, names, ids
-        except: 
-            return [], [], [], []
+            success, msg, pts, cols = self.optimizer.run(self.axis_mode, self.count, self.safe_dist)
+            self.finished.emit(success, msg, pts, cols)
+        except Exception as e:
+            self.finished.emit(False, f"线程错误: {str(e)}", [],[])
 
-    def _remove_noise_artifacts(self, points, colors, names, ids, connection_radius=3.0):
-        if len(points) == 0: return points, colors, names, ids
-        
-        # 建立 KDTree
-        tree = cKDTree(points)
-        pairs = tree.query_pairs(r=connection_radius)
-        if len(pairs) == 0: return points, colors, names, ids
-
-        # 连通域分析
-        pairs = np.array(list(pairs))
-        data = np.ones(len(pairs), dtype=bool)
-        graph = csr_matrix((data, (pairs[:, 0], pairs[:, 1])), shape=(len(points), len(points)))
-        n, labels = connected_components(csgraph=graph, directed=False, return_labels=True)
-        
-        # 保留最大连通域
-        largest_cluster_id = np.argmax(np.bincount(labels))
-        mask = (labels == largest_cluster_id)
-        
-        return points[mask], colors[mask], names[mask], ids[mask]
-
-    def _get_surface_voxel_sample(self, points, colors, names, ids, grid_size):
-        # 体素化网格采样
-        grid_indices = np.floor(points / grid_size).astype(int)
-        _, unique_indices = np.unique(grid_indices, axis=0, return_index=True)
-        return points[unique_indices], colors[unique_indices], names[unique_indices], ids[unique_indices]
-
-    def _optimize_for_drone_count(self, points, colors, names, ids, target_count):
-        # 估算初始网格大小
-        min_b = points.min(axis=0)
-        max_b = points.max(axis=0)
-        approx_area = 2 * np.sum((max_b - min_b) * np.roll(max_b - min_b, 1))
-        current_grid_size = np.sqrt(approx_area / target_count) * 0.8 
-        
-        best_res = (points, colors, names, ids)
-        min_error = float('inf')
-
-        # 迭代逼近目标数量
-        for i in range(20):
-            t_pts, t_cols, t_nms, t_ids = self._get_surface_voxel_sample(points, colors, names, ids, current_grid_size)
-            
-            error = abs(len(t_pts) - target_count)
-            if error < min_error:
-                min_error = error
-                best_res = (t_pts, t_cols, t_nms, t_ids)
-                
-            if error < (target_count * 0.05): 
-                break
-            
-            # 调整网格大小
-            factor = np.clip(np.sqrt(len(t_pts) / target_count), 0.8, 1.2)
-            current_grid_size *= factor
-            
-        return best_res
-
-    def _finalize_drone_layout(self, curr_pts, curr_cols, curr_nms, curr_ids, src_pts, src_cols, src_nms, src_ids, target_count, min_dist):
-        current_count = len(curr_pts)
-        diff = target_count - current_count
-        
-        if diff == 0: 
-            return curr_pts, curr_cols, curr_nms, curr_ids
-        
-        elif diff < 0:
-            # 随机移除多余点
-            indices = np.random.choice(current_count, target_count, replace=False)
-            return curr_pts[indices], curr_cols[indices], curr_nms[indices], curr_ids[indices]
-        
-        else:
-            # 智能补点：从源数据中寻找离现有集最远的点
-            source_tree = cKDTree(curr_pts)
-            dists, _ = source_tree.query(src_pts, k=1)
-            
-            # 筛选满足安全距离的候选点
-            mask = dists > min_dist
-            cand_pts = src_pts[mask]
-            cand_cols = src_cols[mask]
-            cand_nms = src_nms[mask]
-            cand_ids = src_ids[mask]
-            cand_dists = dists[mask]
-            
-            num_to_add = min(len(cand_pts), diff)
-            if num_to_add == 0: 
-                return curr_pts, curr_cols, curr_nms, curr_ids
-            
-            # 优先选距离最远的
-            sorted_indices = np.argsort(cand_dists)[::-1][:num_to_add]
-            
-            return (np.vstack((curr_pts, cand_pts[sorted_indices])),
-                    np.vstack((curr_cols, cand_cols[sorted_indices])),
-                    np.concatenate((curr_nms, cand_nms[sorted_indices])),
-                    np.concatenate((curr_ids, cand_ids[sorted_indices])))
-
-# ==========================================
-# 模块 3: 动画导出 (AnimationExporter)
-# ==========================================
-class AnimationExporter:
+# =========================================================================
+# 主界面逻辑
+# =========================================================================
+class MainWindow(QMainWindow):
     def __init__(self):
-        self.TARGET_MAP = {}
-        self.COLOR_MAP = {}
-        self.SKINNING_DATA = {}
-
-    def get_animations(self, fbx_file):
-        """扫描 FBX 文件获取动画列表"""
-        manager = fbx.FbxManager.Create()
-        scene = fbx.FbxScene.Create(manager, "Scene")
-        importer = fbx.FbxImporter.Create(manager, "")
-        if not importer.Initialize(fbx_file, -1, manager.GetIOSettings()): return []
-        importer.Import(scene)
-        importer.Destroy()
+        super().__init__()
+        self.setWindowTitle("无人机编队设计系统")
+        self.resize(1300, 850)
         
-        criteria = fbx.FbxCriteria.ObjectType(fbx.FbxAnimStack.ClassId)
-        num_stacks = scene.GetSrcObjectCount(criteria)
-        anims = []
-        for i in range(num_stacks):
-            s = scene.GetSrcObject(criteria, i)
-            span = s.GetLocalTimeSpan()
-            dur = span.GetStop().GetSecondDouble() - span.GetStart().GetSecondDouble()
-            anims.append({"name": s.GetName(), "duration": dur, "index": i})
-        manager.Destroy()
-        return anims
+        self.extractor = drone_core.DataExtractor()
+        self.optimizer = drone_core.FormationOptimizer()
+        self.exporter = drone_core.AnimationExporter()
+        self.optimizer_traj = drone_core.TrajectoryOptimizer()
+        self.composer = drone_composition.CompositionManager() 
+        
+        self.current_fbx = ""
+        self.animations = [] 
+        self.playing = False
+        self.anim_frames = {}
+        self.anim_timer = QTimer()
+        self.anim_timer.timeout.connect(self.update_plot)
+        self.current_frame = 0
+        self.total_frames = 0
+        self.current_csv = ""
+        
+        self.scatter = None
+        self.current_static_pts = None 
+        self.current_static_cols = None
+        
+        self.ax = None 
+        self.worker = None 
+        self.export_worker = None
 
-    def run_export(self, fbx_file, anim_index, custom_duration, fps, scale, axis_mode, static_threshold, end_buffer, boundaries):
-        """
-        核心导出函数
-        参数包含：边界限制、时间缩放、骨骼解算等
-        """
-        # 1. 加载 final_formation.npz
+        self.init_ui()
+
+    def init_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QHBoxLayout(main_widget)
+        
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_panel.setFixedWidth(380)
+        
+        self.tabs = QTabWidget()
+        
+        # --- Tab 1: 静态处理 ---
+        tab1 = QWidget()
+        tab1_layout = QVBoxLayout(tab1)
+        
+        grp_file = QGroupBox("1. 文件加载")
+        lay_file = QVBoxLayout()
+        self.btn_load = QPushButton("选择 FBX 文件")
+        self.btn_load.clicked.connect(self.load_file)
+        self.lbl_file = QLabel("未选择文件")
+        self.lbl_file.setWordWrap(True)
+        lay_file.addWidget(self.btn_load)
+        lay_file.addWidget(self.lbl_file)
+        grp_file.setLayout(lay_file)
+        
+        grp_ext = QGroupBox("2. 提取设置")
+        lay_ext = QVBoxLayout()
+        lay_scale = QHBoxLayout()
+        lay_scale.addWidget(QLabel("初始缩放:"))
+        self.spin_scale = QDoubleSpinBox()
+        self.spin_scale.setValue(2.0)
+        lay_scale.addWidget(self.spin_scale)
+        lay_ext.addLayout(lay_scale)
+        self.btn_extract = QPushButton("提取全量数据 (PointWithColor)")
+        self.btn_extract.clicked.connect(self.run_extract)
+        lay_ext.addWidget(self.btn_extract)
+        grp_ext.setLayout(lay_ext)
+        
+        grp_opt = QGroupBox("3. 编队优化 (静态)")
+        lay_opt = QVBoxLayout()
+        lay_count = QHBoxLayout()
+        lay_count.addWidget(QLabel("目标数量:"))
+        self.spin_count = QSpinBox()
+        self.spin_count.setRange(10, 99999)
+        self.spin_count.setValue(600)
+        lay_count.addWidget(self.spin_count)
+        lay_opt.addLayout(lay_count)
+        lay_axis = QHBoxLayout()
+        lay_axis.addWidget(QLabel("坐标修正:"))
+        self.combo_axis = QComboBox()
+        self.combo_axis.addItems(["Mode 0", "Mode 1 (Y/Z)", "Mode 2 (X/Z)", "Mode 3 (X/Y)", "Mode 4 (Rot90)"])
+        self.combo_axis.setCurrentIndex(1)
+        lay_axis.addWidget(self.combo_axis)
+        lay_opt.addLayout(lay_axis)
+        self.btn_optimize = QPushButton("生成静态编队 (预览)")
+        self.btn_optimize.clicked.connect(self.run_optimize)
+        lay_opt.addWidget(self.btn_optimize)
+        grp_opt.setLayout(lay_opt)
+        
+        tab1_layout.addWidget(grp_file)
+        tab1_layout.addWidget(grp_ext)
+        tab1_layout.addWidget(grp_opt)
+        tab1_layout.addStretch()
+        
+        # --- Tab 2: 动态设置 ---
+        tab2 = QWidget()
+        tab2_layout = QVBoxLayout(tab2)
+        
+        grp_config = QGroupBox("0. 表演/物理参数配置")
+        lay_config = QVBoxLayout()
+        lay_safe_config = QHBoxLayout()
+        lay_safe_config.addWidget(QLabel("最小安全距离(m):"))
+        self.spin_safe_config = QDoubleSpinBox(); self.spin_safe_config.setRange(0.1, 50.0); self.spin_safe_config.setValue(1.5)
+        lay_safe_config.addWidget(self.spin_safe_config)
+        lay_config.addLayout(lay_safe_config)
+        
+        lay_vel_config = QHBoxLayout()
+        lay_vel_config.addWidget(QLabel("最大飞行速度(m/s):"))
+        self.spin_max_vel = QDoubleSpinBox(); self.spin_max_vel.setRange(0.1, 100.0); self.spin_max_vel.setValue(10.0)
+        lay_vel_config.addWidget(self.spin_max_vel)
+        lay_config.addLayout(lay_vel_config)
+        
+        lay_config.addWidget(QLabel("场地边界 (L x W x H):"))
+        h4 = QHBoxLayout()
+        self.spin_L = QDoubleSpinBox(); self.spin_L.setRange(1, 9e6); self.spin_L.setValue(200); self.spin_L.setPrefix("L:")
+        self.spin_W = QDoubleSpinBox(); self.spin_W.setRange(1, 9e6); self.spin_W.setValue(200); self.spin_W.setPrefix("W:")
+        self.spin_H = QDoubleSpinBox(); self.spin_H.setRange(1, 9e6); self.spin_H.setValue(150); self.spin_H.setPrefix("H:")
+        
+        self.spin_L.valueChanged.connect(self.refresh_scene_if_needed)
+        self.spin_W.valueChanged.connect(self.refresh_scene_if_needed)
+        self.spin_H.valueChanged.connect(self.refresh_scene_if_needed)
+        
+        h4.addWidget(self.spin_L); h4.addWidget(self.spin_W); h4.addWidget(self.spin_H)
+        lay_config.addLayout(h4)
+        
+        lay_time_scale = QHBoxLayout()
+        lay_time_scale.addWidget(QLabel("手动时间缩放:"))
+        self.spin_time_scale = QDoubleSpinBox(); self.spin_time_scale.setRange(0.0, 10.0); self.spin_time_scale.setValue(0.0)
+        lay_time_scale.addWidget(self.spin_time_scale)
+        grp_config.setLayout(lay_config)
+        
+        grp_anim = QGroupBox("4. 动画生成")
+        lay_anim = QVBoxLayout()
+        h_scan = QHBoxLayout()
+        self.btn_scan = QPushButton("扫描动画"); self.btn_scan.clicked.connect(self.scan_animations)
+        self.combo_anim = QComboBox(); 
+        self.combo_anim.currentIndexChanged.connect(self.on_anim_selected)
+        h_scan.addWidget(self.btn_scan); h_scan.addWidget(self.combo_anim)
+        lay_anim.addLayout(h_scan)
+        
+        h_dur = QHBoxLayout()
+        h_dur.addWidget(QLabel("原始时长:"))
+        self.lbl_raw_dur = QLabel("- s") 
+        h_dur.addWidget(self.lbl_raw_dur)
+        h_dur.addStretch()
+        lay_anim.addLayout(h_dur)
+        
+        h_loop = QHBoxLayout()
+        h_loop.addWidget(QLabel("循环次数:"))
+        self.spin_loop = QSpinBox()
+        self.spin_loop.setRange(1, 100); self.spin_loop.setValue(1)
+        h_loop.addWidget(self.spin_loop)
+        lay_anim.addLayout(h_loop)
+
+        self.btn_export = QPushButton(" 生成并自动优化轨迹")
+        self.btn_export.clicked.connect(self.run_export)
+        lay_anim.addWidget(self.btn_export)
+        grp_anim.setLayout(lay_anim)
+        
+        grp_verify = QGroupBox("5. 验证与播放")
+        lay_verify = QVBoxLayout()
+        self.btn_analyze = QPushButton(" 安全性体检")
+        self.btn_analyze.clicked.connect(self.run_safety_check)
+        lay_verify.addWidget(self.btn_analyze)
+        lay_play_ctrl = QHBoxLayout()
+        self.btn_play = QPushButton(" 播放/暂停"); self.btn_play.clicked.connect(self.toggle_play)
+        self.spin_pt = QSpinBox(); self.spin_pt.setValue(5); self.spin_pt.valueChanged.connect(self.update_point_size)
+        lay_play_ctrl.addWidget(self.btn_play); lay_play_ctrl.addWidget(self.spin_pt)
+        lay_verify.addLayout(lay_play_ctrl)
+        grp_verify.setLayout(lay_verify)
+
+        tab2_layout.addWidget(grp_config); tab2_layout.addWidget(grp_anim); tab2_layout.addWidget(grp_verify); tab2_layout.addStretch()
+
+        # --- Tab 3: 编队合成 ---
+        tab3 = QWidget()
+        tab3_layout = QVBoxLayout(tab3)
+        
+        grp_comp_list = QGroupBox("1. 节目单编排")
+        lay_comp_list = QVBoxLayout()
+        self.list_widget = QListWidget()
+        self.list_widget.itemClicked.connect(self.on_list_item_clicked)
+        lay_comp_list.addWidget(self.list_widget)
+        
+        h_comp_btns = QHBoxLayout()
+        self.btn_add_csv = QPushButton("➕ 添加 CSV")
+        self.btn_add_csv.clicked.connect(self.add_comp_file)
+        self.btn_remove_csv = QPushButton("➖ 移除")
+        self.btn_remove_csv.clicked.connect(self.remove_comp_file)
+        h_comp_btns.addWidget(self.btn_add_csv); h_comp_btns.addWidget(self.btn_remove_csv)
+        lay_comp_list.addLayout(h_comp_btns)
+        
+        # 第一行：过渡时间
+        h_trans = QHBoxLayout()
+        h_trans.addWidget(QLabel("过渡(s):"))
+        self.spin_trans_dur = QDoubleSpinBox(); self.spin_trans_dur.setValue(5.0)
+        self.spin_trans_dur.valueChanged.connect(self.update_comp_params)
+        h_trans.addWidget(self.spin_trans_dur)
+        h_trans.addStretch()
+        lay_comp_list.addLayout(h_trans)
+        
+        # 第二行：自转设置
+        h_rot = QHBoxLayout()
+        h_rot.addWidget(QLabel("自转(XYZ):"))
+        self.spin_rot_x = QDoubleSpinBox(); self.spin_rot_x.setRange(-360, 360)
+        self.spin_rot_y = QDoubleSpinBox(); self.spin_rot_y.setRange(-360, 360)
+        self.spin_rot_z = QDoubleSpinBox(); self.spin_rot_z.setRange(-360, 360)
+        self.spin_rot_x.valueChanged.connect(self.update_comp_params)
+        self.spin_rot_y.valueChanged.connect(self.update_comp_params)
+        self.spin_rot_z.valueChanged.connect(self.update_comp_params)
+        h_rot.addWidget(self.spin_rot_x); h_rot.addWidget(self.spin_rot_y); h_rot.addWidget(self.spin_rot_z)
+        lay_comp_list.addLayout(h_rot)
+        
+        # 【新增】第三行：位移设置
+        h_pos = QHBoxLayout()
+        h_pos.addWidget(QLabel("位移(XYZ):"))
+        self.spin_pos_x = QDoubleSpinBox(); self.spin_pos_x.setRange(-9999, 9999)
+        self.spin_pos_y = QDoubleSpinBox(); self.spin_pos_y.setRange(-9999, 9999)
+        self.spin_pos_z = QDoubleSpinBox(); self.spin_pos_z.setRange(-9999, 9999)
+        self.spin_pos_x.valueChanged.connect(self.update_comp_params)
+        self.spin_pos_y.valueChanged.connect(self.update_comp_params)
+        self.spin_pos_z.valueChanged.connect(self.update_comp_params)
+        h_pos.addWidget(self.spin_pos_x); h_pos.addWidget(self.spin_pos_y); h_pos.addWidget(self.spin_pos_z)
+        lay_comp_list.addLayout(h_pos)
+        
+        grp_comp_list.setLayout(lay_comp_list)
+        
+        grp_comp_act = QGroupBox("2. 合成")
+        lay_comp_act = QVBoxLayout()
+        self.btn_merge = QPushButton(" 开始合成")
+        self.btn_merge.setStyleSheet("background-color: #1976D2; color: white; font-weight: bold; padding: 10px;")
+        self.btn_merge.clicked.connect(self.run_merge)
+        lay_comp_act.addWidget(self.btn_merge)
+        grp_comp_act.setLayout(lay_comp_act)
+        
+        tab3_layout.addWidget(grp_comp_list); tab3_layout.addWidget(grp_comp_act); tab3_layout.addStretch()
+
+        self.tabs.addTab(tab1, "1. 静态预处理")
+        self.tabs.addTab(tab2, "2. 动态与参数")
+        self.tabs.addTab(tab3, "3. 编队合成")
+        left_layout.addWidget(self.tabs)
+        
+        # Right Panel
+        right_panel = QWidget(); right_layout = QVBoxLayout(right_panel)
+        self.fig = Figure(figsize=(5, 5), dpi=100, facecolor='black')
+        self.canvas = FigureCanvas(self.fig)
+        self.ax = self.fig.add_subplot(111, projection='3d') 
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        
+        self.setup_scene(mode='auto')
+        
+        self.log_box = QTextEdit(); self.log_box.setMaximumHeight(150); self.log_box.setReadOnly(True); self.log_box.setStyleSheet("background-color: #222; color: #0f0;")
+        right_layout.addWidget(self.toolbar); right_layout.addWidget(self.canvas); right_layout.addWidget(self.log_box)
+        splitter = QSplitter(Qt.Orientation.Horizontal); splitter.addWidget(left_panel); splitter.addWidget(right_panel); splitter.setStretchFactor(0, 3); splitter.setStretchFactor(1, 7); layout.addWidget(splitter)
+        
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
+    def log(self, msg):
+        self.log_box.append(msg)
+        QApplication.processEvents()
+
+    # (其他函数保持不变...)
+    def reset_all_state(self):
+        self.playing = False
+        self.anim_timer.stop()
+        self.anim_frames = {}
+        self.current_frame = 0
+        self.current_static_pts = None
+        self.current_static_cols = None
+        if self.scatter: self.scatter.remove(); self.scatter = None
+        self.ax.clear(); self.ax.set_facecolor('black'); self.ax.axis('off')
+        self.setup_scene(mode='auto')
+        self.tabs.setCurrentIndex(0)
+
+    def run_optimize(self):
+        self.btn_optimize.setEnabled(False)
+        self.btn_optimize.setText("计算中...请稍候")
+        self.log(" 后台开始计算编队...")
+        
+        self.worker = OptimizationWorker(
+            self.optimizer,
+            self.combo_axis.currentIndex(), 
+            self.spin_count.value(), 
+            self.spin_safe_config.value()
+        )
+        self.worker.finished.connect(self.on_optimize_finished)
+        self.worker.start()
+
+    def on_optimize_finished(self, success, msg, pts, cols):
+        self.btn_optimize.setEnabled(True)
+        self.btn_optimize.setText("生成静态编队 (预览)")
+        self.log(msg)
+        if success:
+            self.current_static_pts = pts
+            self.current_static_cols = cols
+            self.plot_static_memory(pts, cols, force_mode='auto')
+            self.recommend_boundaries_smart(pts, self.spin_count.value(), self.spin_safe_config.value())
+
+    def on_tab_changed(self, index):
+        if index == 0:
+            self.setup_scene(mode='auto')
+            if self.current_static_pts is not None: self.plot_static_memory(self.current_static_pts, self.current_static_cols, force_mode='auto')
+        else: self.setup_scene(mode='box')
+
+    def setup_scene(self, mode='auto'):
+        if self.ax is None: return 
+        self.ax.clear(); self.ax.set_facecolor('black'); self.ax.axis('off')
+        if mode == 'box':
+            try:
+                L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+                axis_len = max(L, W, H) * 0.1
+                self.ax.plot([0, axis_len], [0, 0], [0, 0], color='red')
+                self.ax.plot([0, 0], [0, axis_len], [0, 0], color='green')
+                self.ax.plot([0, 0], [0, 0], [0, axis_len], color='blue')
+                min_x, max_x = -L/2, L/2; min_y, max_y = -W/2, W/2; min_z, max_z = 0, H
+                corners = np.array([[min_x, min_y, min_z], [max_x, min_y, min_z], [max_x, max_y, min_z], [min_x, max_y, min_z], [min_x, min_y, max_z], [max_x, min_y, max_z], [max_x, max_y, max_z], [min_x, max_y, max_z]])
+                edges = [(0,1), (1,2), (2,3), (3,0), (4,5), (5,6), (6,7), (7,4), (0,4), (1,5), (2,6), (3,7)]
+                for s, e in edges: self.ax.plot3D([corners[s][0], corners[e][0]], [corners[s][1], corners[e][1]], [corners[s][2], corners[e][2]], color='gray', linestyle='--', alpha=0.5)
+                self.ax.set_xlim(min_x, max_x); self.ax.set_ylim(min_y, max_y); self.ax.set_zlim(min_z, max_z); self.ax.set_box_aspect((L, W, H))
+            except: pass
+        self.scatter = self.ax.scatter([], [], [], c=[], s=self.spin_pt.value())
+        self.canvas.draw()
+
+    def refresh_scene_if_needed(self):
+        if self.tabs.currentIndex() > 0: self.setup_scene(mode='box')
+
+    def load_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "选择 FBX", "", "FBX Files (*.fbx)")
+        if fname: self.reset_all_state(); self.current_fbx = fname; self.lbl_file.setText(os.path.basename(fname)); self.log(f"已加载: {fname}")
+
+    def run_extract(self):
+        if not self.current_fbx: return self.log(" 请先选择文件")
+        self.log(" 提取中...")
         try:
-            data = np.load("final_formation.npz")
-            names = data['mesh_names']
-            ids = data['vertex_ids']
-            colors = data['ref_colors']
-            self.TARGET_MAP = {}
-            self.COLOR_MAP = {}
-            for n, i, c in zip(names, ids, colors):
-                n_str = str(n)
-                key = (n_str, int(i))
-                if n_str not in self.TARGET_MAP: self.TARGET_MAP[n_str] = set()
-                self.TARGET_MAP[n_str].add(int(i))
-                self.COLOR_MAP[key] = c
-        except: return False, "找不到 final_formation.npz"
+            success, msg = self.extractor.run(self.current_fbx, self.spin_scale.value())
+            self.log(msg)
+        except Exception as e: self.log(f" 提取崩溃: {e}"); print(traceback.format_exc())
 
-        # 2. 准备 FBX
-        manager = fbx.FbxManager.Create()
-        scene = fbx.FbxScene.Create(manager, "Scene")
-        importer = fbx.FbxImporter.Create(manager, "")
-        if not importer.Initialize(fbx_file, -1, manager.GetIOSettings()): return False, "无法读取FBX"
-        importer.Import(scene)
-        importer.Destroy()
-
-        # 3. 设置动画
-        criteria = fbx.FbxCriteria.ObjectType(fbx.FbxAnimStack.ClassId)
-        target_stack = scene.GetSrcObject(criteria, anim_index)
-        scene.SetCurrentAnimationStack(target_stack)
-        
-        span = target_stack.GetLocalTimeSpan()
-        start = span.GetStart().GetSecondDouble()
-        
-        # 计算最大帧
-        max_frames = int(custom_duration * fps)
-
-        # 4. 预计算骨骼蒙皮数据
-        self._prepare_skinning_data(scene)
-
-        # 5. 导出 CSV
+    def recommend_boundaries_smart(self, pts, count, safe_dist):
         try:
-            with open("drone_path.csv", 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                writer.writerow(["Frame", "Time", "Object", "VertexID", "X", "Y", "Z", "R", "G", "B"])
-                root = scene.GetRootNode()
-                if root:
-                    # 传入 boundaries 参数
-                    self._process_node_smart(root, start, max_frames, fps, scale, axis_mode, static_threshold, end_buffer, boundaries, writer)
-        except Exception as e:
-            return False, f"导出失败: {str(e)}"
-        
-        manager.Destroy()
-        return True, "导出成功！"
+            min_x, max_x = pts[:,0].min(), pts[:,0].max(); min_y, max_y = pts[:,1].min(), pts[:,1].max(); min_z, max_z = pts[:,2].min(), pts[:,2].max()
+            curr_L = max_x - min_x; curr_W = max_y - min_y; curr_H = max_z - min_z
+            if len(pts) > 1:
+                tree = cKDTree(pts); dists, _ = tree.query(pts, k=2); avg_neighbor_dist = np.mean(dists[:, 1])
+            else: avg_neighbor_dist = safe_dist
+            if avg_neighbor_dist < 0.001: avg_neighbor_dist = 0.001
+            ratio = 1.0
+            if avg_neighbor_dist < safe_dist: ratio = safe_dist / avg_neighbor_dist
+            sug_L = curr_L * ratio * 1.1; sug_W = curr_W * ratio * 1.1; sug_H = curr_H * ratio * 1.1
+            self.log("-" * 35)
+            self.log(f" 智能场地建议: 目标 {safe_dist}m, 当前 {avg_neighbor_dist:.2f}m")
+            if ratio > 1.0: self.log(f"    建议放大 {ratio:.2f} 倍 -> {sug_L:.1f}x{sug_W:.1f}x{sug_H:.1f}")
+            else: self.log(f"    当前尺寸合适")
+            self.log("-" * 35)
+        except Exception as e: print(e)
 
-    def _prepare_skinning_data(self, scene):
-        """ 修复版骨骼数据读取逻辑 (兼容性增强) """
-        self.SKINNING_DATA = {} 
-        src_len = scene.GetSrcObjectCount(fbx.FbxCriteria.ObjectType(fbx.FbxMesh.ClassId))
-        for i in range(src_len):
-            mesh = scene.GetSrcObject(fbx.FbxCriteria.ObjectType(fbx.FbxMesh.ClassId), i)
-            node = mesh.GetNode()
-            if not node: continue
-            mesh_name = node.GetName()
-            if mesh_name not in self.TARGET_MAP: continue
-            target_indices = self.TARGET_MAP[mesh_name]
-            
-            skin_deformer = None
-            for j in range(mesh.GetDeformerCount()):
-                df = mesh.GetDeformer(j)
-                # 使用 GetClassId 兼容性判定
-                if df.GetClassId() == fbx.FbxSkin.ClassId:
-                    skin_deformer = df
-                    break
-            if not skin_deformer: continue 
-            
-            skin = skin_deformer 
-            try: cluster_count = skin.GetClusterCount()
-            except: continue
-
-            for c_idx in range(cluster_count):
-                cluster = skin.GetCluster(c_idx)
-                bone_node = cluster.GetLink() 
-                if not bone_node: continue
-                lMatrix = fbx.FbxAMatrix()
-                cluster.GetTransformLinkMatrix(lMatrix)
-                bind_matrix_inv = lMatrix.Inverse()
-                indices = cluster.GetControlPointIndices()
-                weights = cluster.GetControlPointWeights()
-                for k in range(cluster.GetControlPointIndicesCount()):
-                    v_idx = indices[k]
-                    w = weights[k]
-                    if v_idx in target_indices:
-                        key = (mesh_name, v_idx)
-                        if key not in self.SKINNING_DATA: self.SKINNING_DATA[key] = []
-                        self.SKINNING_DATA[key].append( (bone_node, bind_matrix_inv, w) )
-
-    def _process_node_smart(self, node, start_time, max_frames, fps, scale, axis_mode, static_thresh, end_buffer, boundaries, writer):
-        attr = node.GetNodeAttribute()
-        if attr and attr.GetAttributeType() == fbx.FbxNodeAttribute.EType.eMesh:
-            mesh_name = node.GetName()
-            if mesh_name in self.TARGET_MAP:
-                self._extract_and_prune_data(node, mesh_name, start_time, max_frames, fps, scale, axis_mode, static_thresh, end_buffer, boundaries, writer)
-        for i in range(node.GetChildCount()):
-            self._process_node_smart(node.GetChild(i), start_time, max_frames, fps, scale, axis_mode, static_thresh, end_buffer, boundaries, writer)
-
-    def _extract_and_prune_data(self, node, mesh_name, start_time, max_frames, fps, scale, axis_mode, static_thresh, end_buffer, boundaries, writer):
-        """
-        智能轨迹计算：
-        1. 骨骼/刚体解算
-        2. 空间钳制 (Boundaries)
-        3. 智能静止检测与剪辑
-        """
-        mesh = node.GetMesh()
-        target_ids = self.TARGET_MAP[mesh_name]
-        local_verts = mesh.GetControlPoints()
-        fbx_time = fbx.FbxTime()
-        has_skin = (mesh_name, list(target_ids)[0]) in self.SKINNING_DATA
-
-        frame_buffer = [] 
-        prev_frame_coords = None
-        last_moving_frame = 0 
-        
-        # 解包边界
-        min_x, max_x, min_y, max_y, min_z, max_z = boundaries
-
-        for f in range(max_frames + 1):
-            curr_sec = start_time + (f / fps)
-            fbx_time.SetSecondDouble(curr_sec)
-            global_trans = node.EvaluateGlobalTransform(fbx_time)
-            
-            current_frame_data = [] 
-            current_coords_only = [] 
-
-            for v_idx in target_ids:
-                local_pos = local_verts[v_idx]
-                final_vec = fbx.FbxVector4(0, 0, 0, 0)
-                
-                if has_skin:
-                    skin_info = self.SKINNING_DATA.get((mesh_name, v_idx), [])
-                    if not skin_info: final_vec = global_trans.MultT(local_pos)
-                    else:
-                        vertex_accumulated = fbx.FbxVector4(0, 0, 0, 0)
-                        for bone_node, bind_inv, weight in skin_info:
-                            curr_bone_matrix = bone_node.EvaluateGlobalTransform(fbx_time)
-                            deform_matrix = curr_bone_matrix * bind_inv
-                            influenced_pos = deform_matrix.MultT(local_pos)
-                            vertex_accumulated += influenced_pos * weight
-                        final_vec = vertex_accumulated
-                else:
-                    final_vec = global_trans.MultT(local_pos)
-                
-                x = final_vec[0] * scale
-                y = final_vec[1] * scale
-                z = final_vec[2] * scale
-                
-                if axis_mode == 1: x, y, z = x, z, y
-                elif axis_mode == 2: x, y, z = z, y, x
-                elif axis_mode == 3: x, y, z = y, x, z
-                elif axis_mode == 4: y, z = z, -y
-                
-                # [核心功能] 空间钳制
-                x = np.clip(x, min_x, max_x)
-                y = np.clip(y, min_y, max_y)
-                z = np.clip(z, min_z, max_z)
-                
-                rgb = self.COLOR_MAP.get((mesh_name, v_idx), [1.0, 1.0, 1.0])
-                r, g, b = int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)
-                
-                current_frame_data.append( (v_idx, x, y, z, f/fps, r, g, b) )
-                current_coords_only.append( [x, y, z] )
-            
-            frame_buffer.append(current_frame_data)
-            
-            # 智能静止检测逻辑
-            curr_coords_np = np.array(current_coords_only)
-            if prev_frame_coords is not None:
-                movements = np.linalg.norm(curr_coords_np - prev_frame_coords, axis=1)
-                if np.max(movements) > static_thresh: last_moving_frame = f
-            prev_frame_coords = curr_coords_np
-
-        buffer_frames = int(end_buffer * fps)
-        final_end_frame = min(last_moving_frame + buffer_frames, max_frames)
-        final_end_frame = max(final_end_frame, 1) 
-        
-        for f in range(final_end_frame):
-            for item in frame_buffer[f]:
-                # 写入 [Frame, Time, Obj, ID, X, Y, Z, R, G, B]
-                v_idx, x, y, z, sec, r, g, b = item
-                writer.writerow([f, f"{sec:.3f}", mesh_name, v_idx, f"{x:.4f}", f"{y:.4f}", f"{z:.4f}", r, g, b])
-
-# ==========================================
-# 模块 4: 轨迹自动优化器 (TrajectoryOptimizer)
-# ==========================================
-class TrajectoryOptimizer:
-    def optimize_trajectory(self, csv_file, safe_dist, max_vel, bound_L, bound_W, bound_H, manual_time_scale=None):
+    def scan_animations(self):
+        if not self.current_fbx: return
+        self.log("扫描中..."); 
         try:
-            df = pd.read_csv(csv_file)
-            df = df.sort_values(by=['Frame', 'Object', 'VertexID'])
+            self.animations = self.exporter.get_animations(self.current_fbx)
+            self.combo_anim.blockSignals(True)
+            self.combo_anim.clear()
+            for anim in self.animations: self.combo_anim.addItem(anim['name'])
+            self.combo_anim.blockSignals(False)
+            if self.animations: 
+                self.combo_anim.setCurrentIndex(0)
+                self.on_anim_selected()
+        except Exception as e: self.log(f"扫描崩溃: {e}")
+
+    def on_anim_selected(self):
+        idx = self.combo_anim.currentIndex()
+        if idx < 0: return
+        raw_dur = self.animations[idx]['duration']
+        self.lbl_raw_dur.setText(f"{raw_dur:.2f} s")
+
+    def run_export(self):
+        idx = self.combo_anim.currentIndex()
+        if idx < 0: return self.log("请先选择动画")
+        default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CSV")
+        if not os.path.exists(default_dir): os.makedirs(default_dir)
+        default_name = os.path.join(default_dir, "drone_path.csv")
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存轨迹", default_name, "CSV Files (*.csv)")
+        if not save_path: return
+
+        self.btn_export.setEnabled(False); self.btn_export.setText(" 正在导出...")
+        self.log(f"开始导出: {os.path.basename(save_path)}")
+        L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+        
+        self.export_worker = ExportWorker(
+            self.exporter, self.optimizer_traj, self.current_fbx, self.animations[idx]['index'], 
+            20, 2.0, self.combo_axis.currentIndex(), save_path,
+            self.spin_safe_config.value(), self.spin_max_vel.value(), L, W, H,
+            self.spin_time_scale.value() if self.spin_time_scale.value() > 0 else None,
+            self.spin_loop.value()
+        )
+        self.export_worker.finished.connect(self.on_export_finished); self.export_worker.start()
+
+    def on_export_finished(self, success, msg, path, info):
+        self.btn_export.setEnabled(True); self.btn_export.setText(" 生成并自动优化轨迹")
+        self.log(msg)
+        if success:
+            self.current_csv = path; self.load_csv_for_play()
+            QMessageBox.information(self, "成功", f"导出成功！\n文件: {path}")
+
+    def run_safety_check(self):
+        if not self.current_csv: return self.log("请先生成轨迹")
+        self.log(" 安全分析..."); safety_analyzer.analyze_safety(csv_file=self.current_csv, safe_distance=self.spin_safe_config.value(), max_velocity=self.spin_max_vel.value()); self.log("✅ 图表已生成")
+
+    def plot_static_memory(self, pts, cols, force_mode=None):
+        try:
+            pts_np = np.array(pts); cols_np = np.array(cols)
+            if len(pts_np) == 0: return
+            if force_mode: self.setup_scene(mode=force_mode)
+            visual_pts = pts_np.copy()
+            if force_mode == 'box' or (force_mode is None and self.tabs.currentIndex() == 1): visual_pts[:, 2] += self.spin_H.value() / 2.0
+            self.scatter._offsets3d = (visual_pts[:,0], visual_pts[:,1], visual_pts[:,2])
+            self.scatter.set_color(cols_np)
+            self.canvas.draw()
+        except Exception as e: self.log(f" 绘图出错: {e}")
+
+    def load_csv_for_play(self, csv_file=None):
+        if csv_file: self.current_csv = csv_file
+        self.log(f"加载播放: {self.current_csv}"); self.anim_frames = {}; all_pos = []
+        try:
+            with open(self.current_csv, 'r') as f:
+                reader = csv.reader(f); next(reader)
+                for row in reader:
+                    f_idx = int(row[0]); x,y,z = float(row[4]), float(row[5]), float(row[6]); r,g,b = float(row[7])/255, float(row[8])/255, float(row[9])/255
+                    if f_idx not in self.anim_frames: self.anim_frames[f_idx] = []
+                    self.anim_frames[f_idx].append([x,y,z,r,g,b])
+            self.total_frames = len(self.anim_frames); self.current_frame = 0; 
+            if self.tabs.currentIndex() == 0: self.tabs.setCurrentIndex(1)
+            self.setup_scene(mode='box')
+            self.playing = True; self.anim_timer.start(50)
+        except Exception as e: self.log(f"加载失败: {e}")
+
+    def toggle_play(self): self.playing = not self.playing; self.anim_timer.start() if self.playing else self.anim_timer.stop()
+    def update_point_size(self): 
+        if self.scatter: self.scatter.set_sizes([self.spin_pt.value()]); self.canvas.draw()
+    def update_plot(self):
+        if not self.anim_frames: return
+        try:
+            data = np.array(self.anim_frames.get(self.current_frame, []))
+            if len(data) > 0:
+                self.scatter._offsets3d = (data[:,0], data[:,1], data[:,2])
+                self.scatter.set_color(data[:,3:])
+                self.scatter.set_sizes([self.spin_pt.value()])
+                self.current_frame = (self.current_frame + 1) % self.total_frames
+                self.canvas.draw()
+        except: pass
+
+    # --- Tab 3: List handling ---
+    def add_comp_file(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "添加 CSV", "", "CSV Files (*.csv)")
+        if fname:
+            ok, msg = self.composer.add_file(fname)
+            if ok: self.log(msg); self.refresh_list()
+            else: self.log(f" {msg}")
+    def remove_comp_file(self):
+        row = self.list_widget.currentRow()
+        if row >= 0: self.composer.remove_file(row); self.refresh_list()
+    
+    def on_list_item_clicked(self, item):
+        row = self.list_widget.row(item)
+        if row >= 0 and row < len(self.composer.playlist):
+            data = self.composer.playlist[row]
+            # 阻断信号
+            self.spin_trans_dur.blockSignals(True)
+            self.spin_rot_x.blockSignals(True)
+            self.spin_rot_y.blockSignals(True)
+            self.spin_rot_z.blockSignals(True)
+            self.spin_pos_x.blockSignals(True)
+            self.spin_pos_y.blockSignals(True)
+            self.spin_pos_z.blockSignals(True)
             
-            # --- 1. 空间缩放 (基于安全距离) ---
-            frames = df['Frame'].unique()
-            min_distances = []
-            sample_step = max(1, len(frames) // 20)
+            self.spin_trans_dur.setValue(data.get('transition_dur', 5.0))
+            rot = data.get('rotation', [0,0,0])
+            self.spin_rot_x.setValue(rot[0])
+            self.spin_rot_y.setValue(rot[1])
+            self.spin_rot_z.setValue(rot[2])
+            pos = data.get('position', [0,0,0])
+            self.spin_pos_x.setValue(pos[0])
+            self.spin_pos_y.setValue(pos[1])
+            self.spin_pos_z.setValue(pos[2])
             
-            for f in frames[::sample_step]:
-                current_data = df[df['Frame'] == f]
-                pos = current_data[['X', 'Y', 'Z']].values
-                if len(pos) > 1:
-                    dists = pdist(pos)
-                    if len(dists) > 0: min_distances.append(np.min(dists))
-            
-            min_dist_original = np.min(min_distances) if min_distances else 0.001
-            if min_dist_original <= 0: min_dist_original = 0.001
-            
-            spatial_scale = 1.0
-            if min_dist_original < safe_dist:
-                spatial_scale = safe_dist / min_dist_original * 1.05 # 稍微留点余量
-            
-            # 边界限制检查
-            all_pos = df[['X', 'Y', 'Z']].values
-            min_xyz = all_pos.min(axis=0)
-            max_xyz = all_pos.max(axis=0)
-            dims = max_xyz - min_xyz
-            pred_dims = dims * spatial_scale
-            
-            limit_x = bound_L / pred_dims[0] if pred_dims[0] > bound_L else 999
-            limit_y = bound_W / pred_dims[1] if pred_dims[1] > bound_W else 999
-            limit_z = bound_H / pred_dims[2] if pred_dims[2] > bound_H else 999
-            limit_scale = min(limit_x, limit_y, limit_z)
-            
-            if limit_scale < 1.0:
-                spatial_scale *= limit_scale
-                
-            # 应用空间缩放
-            center = (max_xyz + min_xyz) / 2
-            df['X'] = center[0] + (df['X'] - center[0]) * spatial_scale
-            df['Y'] = center[1] + (df['Y'] - center[1]) * spatial_scale
-            df['Z'] = center[2] + (df['Z'] - center[2]) * spatial_scale
-            
-            # --- 2. 时间缩放 (基于最大速度) ---
-            df.sort_values(['VertexID', 'Frame'], inplace=True)
-            dt = df['Time'].diff().mean()
-            if dt <= 0: dt = 0.05
-            
-            df['dX'] = df['X'].diff()
-            df['dY'] = df['Y'].diff()
-            df['dZ'] = df['Z'].diff()
-            df['ID_diff'] = df['VertexID'].diff()
-            valid_moves = df[df['ID_diff'] == 0]
-            
-            dist_sq = valid_moves['dX']**2 + valid_moves['dY']**2 + valid_moves['dZ']**2
-            max_dist_step = np.sqrt(dist_sq.max())
-            curr_max_vel = max_dist_step / dt
-            
-            time_scale = 1.0
-            if curr_max_vel > max_vel:
-                time_scale = curr_max_vel / max_vel * 1.1
-            
-            if manual_time_scale:
-                time_scale = manual_time_scale
-            
-            df['Time'] *= time_scale
-            
-            # 保存
-            output_file = "drone_path_optimized.csv"
-            cols = ["Frame", "Time", "Object", "VertexID", "X", "Y", "Z", "R", "G", "B"]
-            df[cols].to_csv(output_file, index=False)
-            
-            info = {
-                'spatial_scale': spatial_scale,
-                'time_scale': time_scale,
-                'orig_min_dist': min_dist_original,
-                'final_max_vel': curr_max_vel / time_scale
-            }
-            return True, "优化完成", output_file, info
-            
-        except Exception as e:
-            return False, f"优化失败: {str(e)}", "", {}
+            # 恢复信号
+            self.spin_trans_dur.blockSignals(False)
+            self.spin_rot_x.blockSignals(False)
+            self.spin_rot_y.blockSignals(False)
+            self.spin_rot_z.blockSignals(False)
+            self.spin_pos_x.blockSignals(False)
+            self.spin_pos_y.blockSignals(False)
+            self.spin_pos_z.blockSignals(False)
+
+    def update_comp_params(self):
+        row = self.list_widget.currentRow()
+        if row >= 0:
+            self.composer.set_transition_duration(row, self.spin_trans_dur.value())
+            self.composer.set_rotation(row, self.spin_rot_x.value(), self.spin_rot_y.value(), self.spin_rot_z.value())
+            self.composer.set_position(row, self.spin_pos_x.value(), self.spin_pos_y.value(), self.spin_pos_z.value())
+            self.refresh_list()
+            self.list_widget.setCurrentRow(row)
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        for i, item in enumerate(self.composer.playlist):
+            name = os.path.basename(item['file'])
+            dur = item['transition_dur']
+            rot = item.get('rotation', [0,0,0])
+            pos = item.get('position', [0,0,0])
+            # 显示更详细的信息
+            txt = f"[{i+1}] {name}\n    Rot:{rot} | Pos:{pos}"
+            if i < len(self.composer.playlist) - 1:
+                txt += f"\n    ( ↘ 过渡: {dur}s ↘ )"
+            else:
+                txt += "\n    (  结束 )"
+            self.list_widget.addItem(txt)
+
+    def run_merge(self):
+        if len(self.composer.playlist) < 2: return self.log(" 至少需要两个文件才能合成")
+        save_path, _ = QFileDialog.getSaveFileName(self, "保存合成文件", "Full_Show.csv", "CSV Files (*.csv)")
+        if not save_path: return
+        
+        # 获取场地边界传递给后台
+        L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+        
+        self.log(" 开始合成 ..."); QApplication.processEvents()
+        ok, msg = self.composer.merge_shows(save_path, self.spin_safe_config.value(), (L, W, H))
+        self.log(msg)
+        if ok: self.current_csv = save_path; self.load_csv_for_play()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
