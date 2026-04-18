@@ -21,7 +21,7 @@ class CompositionManager:
                 'file': csv_path,
                 'transition_dur': 5.0,
                 'rotation': [0, 0, 0],
-                'position': [0, 0, 0], # 新增：默认不位移
+                'position': [0, 0, 0],
                 'data': df
             }
             self.playlist.append(item)
@@ -44,31 +44,21 @@ class CompositionManager:
         if 0 <= index < len(self.playlist):
             self.playlist[index]['rotation'] = [x, y, z]
 
-    # 新增：设置位移
+    # 设置位移
     def set_position(self, index, x, y, z):
         if 0 <= index < len(self.playlist):
             self.playlist[index]['position'] = [x, y, z]
 
-    # 【核心逻辑】：应用原地旋转 + 全局位移
     def _apply_transform(self, df, rotation, position):
-        """
-        1. 计算质心并归零 (Centering)
-        2. 旋转 (Rotate)
-        3. 复原质心 (Restore) -> 实现原地自转
-        4. 应用位移 (Translate) -> 实现位置偏移
-        """
         if not rotation and not position:
-            return # 无操作
+            return 
             
         pts = df[['X', 'Y', 'Z']].values
-        
-        # 1. 计算质心
         centroid = np.mean(pts, axis=0)
         
-        # 2. 归零
         pts_centered = pts - centroid
         
-        # 3. 旋转 (绕原点，即绕自身的几何中心)
+
         if any(r != 0 for r in rotation):
             rads = np.radians(rotation)
             rx, ry, rz = rads[0], rads[1], rads[2]
@@ -77,23 +67,20 @@ class CompositionManager:
             Ry = np.array([[np.cos(ry), 0, np.sin(ry)], [0, 1, 0], [-np.sin(ry), 0, np.cos(ry)]])
             Rz = np.array([[np.cos(rz), -np.sin(rz), 0], [np.sin(rz), np.cos(rz), 0], [0, 0, 1]])
             
-            # Z * Y * X order
+            
             R = Rz @ Ry @ Rx
             pts_centered = pts_centered @ R.T
             
-        # 4. 复原质心 + 5. 应用用户位移
+        
         final_pts = pts_centered + centroid + np.array(position)
         
         df['X'] = final_pts[:, 0]
         df['Y'] = final_pts[:, 1]
         df['Z'] = final_pts[:, 2]
 
-    # 【新增】：强制边界检查
+    
     def _enforce_boundaries(self, df, bounds):
-        """
-        检查这一段动画是否飞出了 L/W/H 的范围。
-        如果有，整体平移回来，而不是缩放（保持编队形状）。
-        """
+     
         L, W, H = bounds
         # X: [-L/2, L/2], Y: [-W/2, W/2], Z: [0, H]
         min_x, max_x = df['X'].min(), df['X'].max()
@@ -112,9 +99,9 @@ class CompositionManager:
         if max_y > W/2: shift_y = (W/2) - max_y
         elif min_y < -W/2: shift_y = (-W/2) - min_y
         
-        # Z轴检查 (高度)
-        if max_z > H: shift_z = H - max_z # 往下压
-        elif min_z < 0: shift_z = 0 - min_z # 往上提
+        # Z轴检查 
+        if max_z > H: shift_z = H - max_z 
+        elif min_z < 0: shift_z = 0 - min_z
         
         if shift_x != 0 or shift_y != 0 or shift_z != 0:
             print(f"   [边界修正] 修正偏移: ({shift_x:.2f}, {shift_y:.2f}, {shift_z:.2f})")
@@ -132,7 +119,7 @@ class CompositionManager:
         dt = 1.0 / fps
         
         try:
-            # === 处理第一个文件 ===
+            # 处理第一个文件
             first_item = self.playlist[0]
             df_curr = first_item['data'].copy()
             
@@ -154,7 +141,7 @@ class CompositionManager:
             prev_end_pos = last_frame_data[['X', 'Y', 'Z']].values
             prev_ids = last_frame_data['VertexID'].values
             
-            # === 循环处理后续文件 ===
+            # 循环处理后续文件
             for i in range(1, len(self.playlist)):
                 item = self.playlist[i]
                 df_next = item['data'].copy()

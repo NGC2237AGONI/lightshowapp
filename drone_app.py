@@ -17,9 +17,6 @@ import drone_core
 import drone_composition 
 import safety_analyzer 
 
-# =========================================================================
-# 导出线程
-# =========================================================================
 class ExportWorker(QThread):
     finished = pyqtSignal(bool, str, str, dict) 
 
@@ -72,9 +69,6 @@ class ExportWorker(QThread):
             traceback.print_exc()
             self.finished.emit(False, f"流程异常: {str(e)}", "", {})
 
-# =========================================================================
-# 静态阵列计算线程
-# =========================================================================
 class OptimizationWorker(QThread):
     finished = pyqtSignal(bool, str, object, object)
 
@@ -92,9 +86,6 @@ class OptimizationWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"线程错误: {str(e)}", [],[])
 
-# =========================================================================
-# 主界面逻辑
-# =========================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -205,7 +196,7 @@ class MainWindow(QMainWindow):
         
         lay_vel_config = QHBoxLayout()
         lay_vel_config.addWidget(QLabel("最大飞行速度(m/s):"))
-        self.spin_max_vel = QDoubleSpinBox(); self.spin_max_vel.setRange(0.1, 100.0); self.spin_max_vel.setValue(10.0)
+        self.spin_max_vel = QDoubleSpinBox(); self.spin_max_vel.setRange(0.1, 100.0); self.spin_max_vel.setValue(8.0)
         lay_vel_config.addWidget(self.spin_max_vel)
         lay_config.addLayout(lay_vel_config)
         
@@ -258,13 +249,32 @@ class MainWindow(QMainWindow):
         
         grp_verify = QGroupBox("5. 验证与播放")
         lay_verify = QVBoxLayout()
+        
+        # =================【新增 UI 控件】=================
+        self.lbl_final_dur = QLabel("最终物理执行时长: - s")
+        self.lbl_final_dur.setStyleSheet("color: #FF5722; font-weight: bold;")
+        lay_verify.addWidget(self.lbl_final_dur)
+        
+        self.combo_play_speed = QComboBox()
+        self.combo_play_speed.addItems(["真实物理速度", "设计原速动画预览"])
+        lay_verify.addWidget(self.combo_play_speed)
+        self.current_time_scale = 1.0 # 初始化拉伸系数记录
+        # ================================================
+
         self.btn_analyze = QPushButton(" 安全性体检")
         self.btn_analyze.clicked.connect(self.run_safety_check)
         lay_verify.addWidget(self.btn_analyze)
+        
         lay_play_ctrl = QHBoxLayout()
-        self.btn_play = QPushButton(" 播放/暂停"); self.btn_play.clicked.connect(self.toggle_play)
-        self.spin_pt = QSpinBox(); self.spin_pt.setValue(5); self.spin_pt.valueChanged.connect(self.update_point_size)
-        lay_play_ctrl.addWidget(self.btn_play); lay_play_ctrl.addWidget(self.spin_pt)
+        self.btn_play = QPushButton(" 播放/暂停")
+        self.btn_play.clicked.connect(self.toggle_play)
+        
+        self.spin_pt = QSpinBox()
+        self.spin_pt.setValue(5)
+        self.spin_pt.valueChanged.connect(self.update_point_size)
+        
+        lay_play_ctrl.addWidget(self.btn_play)
+        lay_play_ctrl.addWidget(self.spin_pt)
         lay_verify.addLayout(lay_play_ctrl)
         grp_verify.setLayout(lay_verify)
 
@@ -498,7 +508,17 @@ class MainWindow(QMainWindow):
         self.btn_export.setEnabled(True); self.btn_export.setText(" 生成并自动优化轨迹")
         self.log(msg)
         if success:
-            self.current_csv = path; self.load_csv_for_play()
+            self.current_csv = path
+            
+            # 【新增】记录缩放系数，更新最终执行时长
+            self.current_time_scale = info.get('time_scale', 1.0)
+            raw_time_str = self.lbl_raw_dur.text().split(' ')[0]
+            try:
+                final_time = float(raw_time_str) * self.current_time_scale
+                self.lbl_final_dur.setText(f"最终物理执行时长: {final_time:.2f} s (拉伸 {self.current_time_scale:.2f} 倍)")
+            except: pass
+            
+            self.load_csv_for_play()
             QMessageBox.information(self, "成功", f"导出成功！\n文件: {path}")
 
     def run_safety_check(self):
@@ -539,12 +559,17 @@ class MainWindow(QMainWindow):
     def update_plot(self):
         if not self.anim_frames: return
         try:
-            data = np.array(self.anim_frames.get(self.current_frame, []))
+            data = np.array(self.anim_frames.get(self.current_frame,[]))
             if len(data) > 0:
                 self.scatter._offsets3d = (data[:,0], data[:,1], data[:,2])
                 self.scatter.set_color(data[:,3:])
                 self.scatter.set_sizes([self.spin_pt.value()])
-                self.current_frame = (self.current_frame + 1) % self.total_frames
+            
+                step = 1
+                if self.combo_play_speed.currentIndex() == 1: 
+                    step = max(1, int(self.current_time_scale))
+                    
+                self.current_frame = (self.current_frame + step) % self.total_frames
                 self.canvas.draw()
         except: pass
 
