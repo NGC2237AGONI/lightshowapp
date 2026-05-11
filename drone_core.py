@@ -5,7 +5,6 @@ import csv
 import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
-# 引入 B 样条插值库，用于实现闭边界 B 样条重构
 from scipy.interpolate import make_interp_spline 
 from scipy.signal import savgol_filter 
 from config_manager import cfg
@@ -13,9 +12,6 @@ import texture_sampler
 import traceback
 import matplotlib.colors as mcolors
 
-# ==========================================
-# 模块 1: 数据提取 (DataExtractor)
-# ==========================================
 class DataExtractor:
     def __init__(self):
         self.all_x = []
@@ -28,30 +24,20 @@ class DataExtractor:
 
     @staticmethod
     def boost_night_sky_visibility(colors, min_brightness=0.4, gamma=0.8):
-        """
-        针对无人机夜空显示的色彩增强算法
-        将过暗的像素提亮，防止无人机在夜空中“隐形”
-        """
         colors_clip = np.clip(colors, 0.0, 1.0)
         
-        # 1. 转换为 HSV (色相、饱和度、明度) 空间
         hsv_colors = mcolors.rgb_to_hsv(colors_clip)
         
         h = hsv_colors[:, 0]
         s = hsv_colors[:, 1]
         v = hsv_colors[:, 2]
         
-        # 2. 伽马校正：平滑地提亮全局暗部
         v = np.power(v, gamma)
         
-        # 3. 亮度钳制 (Clamp)：强制所有颜色不得低于 min_brightness
-        # (默认设定为0.4，即RGB值最低也会被强制拉到约102/255的亮度)
         v = np.clip(v, min_brightness, 1.0)
         
-        # 4. 饱和度轻微补偿（避免提亮后颜色发白/发灰）
         s = np.clip(s * 1.2, 0.0, 1.0)
         
-        # 重组并转回 RGB
         hsv_enhanced = np.column_stack((h, s, v))
         rgb_enhanced = mcolors.hsv_to_rgb(hsv_enhanced)
         return rgb_enhanced
@@ -81,9 +67,8 @@ class DataExtractor:
         points = np.column_stack((self.all_x, self.all_y, self.all_z))
         colors = np.array(self.all_c)
         
-        # 【增强版颜色保底】
         if np.std(colors) < 0.05:
-            print("   [提示] 检测到模型颜色单一（贴图可能丢失），强制应用'彩虹高度图'保底。")
+            print(" 贴图可能丢失，应用'彩虹高度图'")
             z_vals = points[:, 2]
             if len(z_vals) > 0:
                 z_min, z_max = z_vals.min(), z_vals.max()
@@ -104,7 +89,7 @@ class DataExtractor:
                  points=points, colors=colors, 
                  mesh_names=mesh_names, vertex_ids=vertex_ids)
         
-        return True, f"提取完成！原始采样池: {len(self.all_x)} 点 (高画质模式)"
+        return True, f"提取完成qwq！原始采样: {len(self.all_x)} 点 "
 
     def _process_node(self, node, scale):
         attr = node.GetNodeAttribute()
@@ -175,10 +160,6 @@ class DataExtractor:
                 return final_colors
         return final_colors
 
-# ==========================================
-# 模块 2: 编队优化 (高阶版：特征感知与自适应泊松盘混合采样)
-# 落实中期报告 6.2.1: 引入 Shannon Entropy 动态调节 Beta
-# ==========================================
 class FormationOptimizer:
     def run(self, axis_mode, target_count, safety_distance):
         try:
@@ -230,16 +211,11 @@ class FormationOptimizer:
             return False, f"优化逻辑发生异常: {str(e)}", None, None
 
     def _calculate_shannon_entropy(self, colors):
-        """计算模型整体色彩分布的香农信息熵"""
         colors_clip = np.clip(colors, 0.0, 1.0)
-        # 转为灰度值
         gray = 0.299 * colors_clip[:,0] + 0.587 * colors_clip[:,1] + 0.114 * colors_clip[:,2]
-        # 统计 256 级灰度直方图
         hist, _ = np.histogram(gray, bins=256, range=(0.0, 1.0), density=True)
-        # 计算概率分布
         p = hist / np.sum(hist)
-        p = p[p > 0] # 排除 0 概率防止 log2 报错
-        # 香农信息熵公式
+        p = p[p > 0] 
         entropy = -np.sum(p * np.log2(p))
         return entropy
 
@@ -408,22 +384,43 @@ class AnimationExporter:
         self.SKINNING_DATA = {} 
         src_len = scene.GetSrcObjectCount(fbx.FbxCriteria.ObjectType(fbx.FbxMesh.ClassId))
         for i in range(src_len):
-            mesh = scene.GetSrcObject(fbx.FbxCriteria.ObjectType(fbx.FbxMesh.ClassId), i); node = mesh.GetNode()
+            mesh = scene.GetSrcObject(fbx.FbxCriteria.ObjectType(fbx.FbxMesh.ClassId), i)
+            node = mesh.GetNode()
             if not node or node.GetName() not in self.TARGET_MAP: continue
-            m_name = node.GetName(); target_ids = self.TARGET_MAP[m_name]
+            
+            m_name = node.GetName()
+            target_ids = self.TARGET_MAP[m_name]
             skin_deformer = None
+            
             for j in range(mesh.GetDeformerCount()):
-                if mesh.GetDeformer(j).GetClassId() == fbx.FbxSkin.ClassId: skin_deformer = mesh.GetDeformer(j); break
+                if mesh.GetDeformer(j).GetClassId() == fbx.FbxSkin.ClassId: 
+                    skin_deformer = mesh.GetDeformer(j)
+                    break
+                    
             if not skin_deformer: continue 
+            
             for c_idx in range(skin_deformer.GetClusterCount()):
-                cluster = skin_deformer.GetCluster(c_idx); bone = cluster.GetLink()
+                cluster = skin_deformer.GetCluster(c_idx)
+                bone = cluster.GetLink()
                 if not bone: continue
-                lMatrix = fbx.FbxAMatrix(); cluster.GetTransformLinkMatrix(lMatrix); bind_inv = lMatrix.Inverse()
-                ind = cluster.GetControlPointIndices(); wht = cluster.GetControlPointWeights()
+                
+                # 获取骨骼绑定逆矩阵
+                lMatrix = fbx.FbxAMatrix()
+                cluster.GetTransformLinkMatrix(lMatrix)
+                bind_inv = lMatrix.Inverse()
+                
+                # 【新增核心逻辑 1】：获取网格(Mesh)在绑定骨骼那一刻的世界矩阵
+                transform_matrix = fbx.FbxAMatrix()
+                cluster.GetTransformMatrix(transform_matrix)
+                
+                ind = cluster.GetControlPointIndices()
+                wht = cluster.GetControlPointWeights()
+                
                 for k in range(cluster.GetControlPointIndicesCount()):
                     v_idx = ind[k]
                     if v_idx in target_ids:
-                        self.SKINNING_DATA.setdefault((m_name, v_idx), []).append((bone, bind_inv, wht[k]))
+                        # 【修改】：将 transform_matrix 一起存入字典
+                        self.SKINNING_DATA.setdefault((m_name, v_idx), []).append((bone, bind_inv, transform_matrix, wht[k]))
 
     def _process_node_raw(self, node, start, frames, fps, scale, mode, writer):
         attr = node.GetNodeAttribute()
@@ -434,25 +431,48 @@ class AnimationExporter:
             self._process_node_raw(node.GetChild(i), start, frames, fps, scale, mode, writer)
 
     def _extract_data_raw(self, node, start, frames, fps, scale, mode, writer):
-        mesh = node.GetMesh(); m_name = node.GetName(); target_ids = self.TARGET_MAP[m_name]
-        l_verts = mesh.GetControlPoints(); t = fbx.FbxTime()
+        mesh = node.GetMesh()
+        m_name = node.GetName()
+        target_ids = self.TARGET_MAP[m_name]
+        l_verts = mesh.GetControlPoints()
+        t = fbx.FbxTime()
+        
         for f in range(frames + 1):
             curr_time = f / fps
             t.SetSecondDouble(start + curr_time)
             
             g_trans = node.EvaluateGlobalTransform(t)
+            
             for v_idx in target_ids:
-                final = fbx.FbxVector4(0,0,0,0)
+                final = fbx.FbxVector4(0, 0, 0, 0)
+                
                 if (m_name, v_idx) in self.SKINNING_DATA:
-                    for bone, binv, w in self.SKINNING_DATA[(m_name, v_idx)]:
-                        final += (bone.EvaluateGlobalTransform(t) * binv).MultT(l_verts[v_idx]) * w
-                else: final = g_trans.MultT(l_verts[v_idx])
+                    skinning_list = self.SKINNING_DATA[(m_name, v_idx)]
+                    
+                    # 【新增核心逻辑 2】：计算总权重，防止某些野生 FBX 模型的权重和不等于 1.0 导致模型被撕裂
+                    total_weight = sum([w for _, _, _, w in skinning_list])
+                    
+                    for bone, binv, tmat, w in skinning_list:
+                        # 权重归一化保护
+                        normalized_weight = w / total_weight if total_weight > 0 else 0.0
+                        
+                        # 【核心公式修正】：Bone动画矩阵 * Bone绑定逆矩阵 * Mesh绑定矩阵
+                        cluster_matrix = bone.EvaluateGlobalTransform(t) * binv * tmat
+                        
+                        final += cluster_matrix.MultT(l_verts[v_idx]) * normalized_weight
+                else: 
+                    # 如果没有绑定骨骼，使用节点自身的全局矩阵
+                    final = g_trans.MultT(l_verts[v_idx])
+                    
                 x, y, z = final[0]*scale, final[1]*scale, final[2]*scale
-                if mode == 1: x,y,z = x,z,y
-                elif mode == 2: x,y,z = z,y,x
-                elif mode == 3: x,y,z = y,x,z
-                elif mode == 4: y,z = z,-y
-                rgb = self.COLOR_MAP.get((m_name, v_idx), [1,1,1])
+                
+                # 坐标系矫正逻辑保持不变
+                if mode == 1: x, y, z = x, z, y
+                elif mode == 2: x, y, z = z, y, x
+                elif mode == 3: x, y, z = y, x, z
+                elif mode == 4: y, z = z, -y
+                
+                rgb = self.COLOR_MAP.get((m_name, v_idx), [1, 1, 1])
                 writer.writerow([f, f"{curr_time:.3f}", m_name, v_idx, f"{x:.4f}", f"{y:.4f}", f"{z:.4f}", int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255)])
 
 class TrajectoryOptimizer:
@@ -542,34 +562,66 @@ class TrajectoryOptimizer:
     def optimize_trajectory(self, csv_file, safe_dist, max_vel, bound_L, bound_W, bound_H, manual_time_scale=None):
         try:
             df = pd.read_csv(csv_file)
-            if df.empty: return False, "Empty", "", {}
+            if df.empty: return False, "数据为空", "", {}
             
-            # --- 空间归一化与智能密度缩放 ---
+            # --- 1. 空间归一化与中心化 ---
             all_x = df['X'].values; all_y = df['Y'].values; all_z = df['Z'].values
-            min_x, max_x = np.min(all_x), np.max(all_x); min_y, max_y = np.min(all_y), np.max(all_y); min_z, max_z = np.min(all_z), np.max(all_z)
+            min_x, max_x = np.min(all_x), np.max(all_x)
+            min_y, max_y = np.min(all_y), np.max(all_y)
+            min_z, max_z = np.min(all_z), np.max(all_z)
             data_W, data_D, data_H = max_x - min_x, max_y - min_y, max_z - min_z
-            df['X'] -= (min_x + max_x) / 2.0; df['Y'] -= (min_y + max_y) / 2.0; df['Z'] -= (min_z + max_z) / 2.0
             
+            # 将原始阵型居中，方便后续统一拉伸
+            df['X'] -= (min_x + max_x) / 2.0
+            df['Y'] -= (min_y + max_y) / 2.0
+            df['Z'] -= (min_z + max_z) / 2.0
+            
+            # ================= 致命空间陷阱修复开始 =================
             first_frame_df = df[df['Frame'] == df['Frame'].min()]
             temp_pts = first_frame_df[['X', 'Y', 'Z']].values
+            
             if len(temp_pts) > 1:
-                tree = cKDTree(temp_pts); dists, _ = tree.query(temp_pts, k=2)
-                current_avg_dist = np.mean(dists[:, 1])
+                tree = cKDTree(temp_pts)
+                dists, _ = tree.query(temp_pts, k=2)
+                # 【修复1】：废弃平均值，寻找阵型中最拥挤（距离最短）的两架飞机作为拉伸基准
+                current_min_dist = np.min(dists[:, 1]) 
+                current_avg_dist = np.mean(dists[:, 1]) # 保留平均值用于备用视觉参考
             else:
+                current_min_dist = safe_dist
                 current_avg_dist = safe_dist
                 
-            if current_avg_dist < 1e-4: current_avg_dist = 1e-4
-            density_scale = (safe_dist * 1.2) / current_avg_dist
-            box_limit_scale = min(bound_L/max(data_W, 1e-4), bound_W/max(data_D, 1e-4), bound_H/max(data_H, 1e-4)) * 0.90
-            uniform_scale = min(density_scale, box_limit_scale)
-            df['X'] *= uniform_scale; df['Y'] *= uniform_scale; df['Z'] *= uniform_scale
+            if current_min_dist < 1e-4: current_min_dist = 1e-4
             
+            # 底线原则 A (保命)：必须把最挤的两架飞机拉开到 safe_dist (留 5% 物理冗余)
+            safe_density_scale = (safe_dist * 1.05) / current_min_dist
+            
+            # 底线原则 B (合规)：整个阵型不能撞到用户设定的长宽高边界虚拟墙
+            box_limit_scale = min(bound_L/max(data_W, 1e-4), bound_W/max(data_D, 1e-4), bound_H/max(data_H, 1e-4)) * 0.90
+            
+            # 【修复2】：冲突仲裁机制
+            conflict_msg = ""
+            if safe_density_scale > box_limit_scale:
+                # 当安全与边界发生冲突时，绝对向安全妥协！
+                uniform_scale = safe_density_scale
+                conflict_msg = f"\n   ⚠️ [空间妥协] 场地 {bound_L}x{bound_W} 偏小！为强制保障 {safe_dist}m 的防撞底线，阵型已被迫突破您设置的边界参数。"
+            else:
+                # 场地足够大：在绝对安全的基础上，兼顾原有的视觉张力
+                visual_scale = (safe_dist * 1.2) / max(current_avg_dist, 1e-4)
+                # 确保它既满足最小安全底线，又不超过场地盒子，且保持一定视觉美感
+                uniform_scale = max(safe_density_scale, min(visual_scale, box_limit_scale))
+                
+            # 执行最终的空间物理拉伸
+            df['X'] *= uniform_scale
+            df['Y'] *= uniform_scale
+            df['Z'] *= uniform_scale
+            # ================= 空间陷阱修复结束 =================
+
+            # 调用已升级的动力学势场避障 (APF)
             df = self.apply_physics_repulsion(df, safe_dist)
+            
+            # 重新排序，准备进行时间维度的物理运算
             df = df.sort_values(by=['Object', 'VertexID', 'Frame'])
             
-            # ==========================================================
-            # 【严谨时序 第一段】：基于原始频率，测算极限运动学参数
-            # ==========================================================
             orig_dt = 1.0 / cfg.default_fps
             df['dX'] = df.groupby('VertexID')['X'].diff().fillna(0.0)
             df['dY'] = df.groupby('VertexID')['Y'].diff().fillna(0.0)
@@ -582,7 +634,6 @@ class TrajectoryOptimizer:
             df['Vel_Z'] = df['dZ'] / df['dT']
             df['Vel'] = np.sqrt(df['Vel_X']**2 + df['Vel_Y']**2 + df['Vel_Z']**2)
             
-            # 测算加速度
             df['dVel_X'] = df.groupby('VertexID')['Vel_X'].diff().fillna(0.0)
             df['dVel_Y'] = df.groupby('VertexID')['Vel_Y'].diff().fillna(0.0)
             df['dVel_Z'] = df.groupby('VertexID')['Vel_Z'].diff().fillna(0.0)
@@ -591,25 +642,23 @@ class TrajectoryOptimizer:
             curr_max_vel = df['Vel'].max()
             curr_max_acc = df['Acc'].max()
             
-            # 引入全局配置的极限加速度
             max_acc = cfg.max_accel 
             
-            # 计算拉伸系数 S
+            # ================= 时间拉伸降速自保机制 =================
             s_vel = curr_max_vel / max_vel if curr_max_vel > max_vel else 1.0
             s_acc = np.sqrt(curr_max_acc / max_acc) if curr_max_acc > max_acc else 1.0
             s = max(1.0, s_vel, s_acc)
             if manual_time_scale and manual_time_scale > 1.0: 
                 s = max(s, manual_time_scale)
             
-            # ==========================================================
-            # 【严谨时序 第二段】：先拉伸时间轴，再高频重构！
-            # ==========================================================
+            # 将物理时间拉长，压制速度和加速度
             df['Time'] = df['Time'] * s
+            # ========================================================
             
-            # 此时传入的 df，时间轴已经被拉伸完毕。
-            # 函数内部将在拉长后的时间轴上，严格按 dt=0.02s(50Hz) 切片。
+            # 高频 B 样条重采样平滑曲线
             df = self.smooth_trajectory_b_spline(df, dt_sample=1.0/cfg.high_density_fps)
             
+            # 整体拔高，放置在边界的 H/2 高度上（保证最低点不砸地）
             df['Z'] += bound_H / 2.0
             
             final_max_vel = curr_max_vel / s
@@ -618,49 +667,180 @@ class TrajectoryOptimizer:
             df.to_csv(csv_file, index=False)
             info = {'spatial_scale': uniform_scale, 'time_scale': s, 'orig_max_vel': curr_max_vel, 'final_max_vel': final_max_vel}
             
-            msg = f"重构完成\n"
-            msg += f" 原始极限速: {curr_max_vel:.2f} m/s | 原始极限加速度: {curr_max_acc:.2f} m/s²\n"
+            # 组装 UI 报告
+            msg = f"✅ 重构与优化完成\n"
+            msg += f"  📐 空间缩放: 放大了 {uniform_scale:.2f} 倍{conflict_msg}\n"
+            msg += f"  🏎️ 原始极限速: {curr_max_vel:.2f} m/s | 原始极限过载: {curr_max_acc:.2f} m/s²\n"
             if s > 1.0:
-                msg += f"  全局时间拉伸 {s:.2f} 倍\n"
-            msg += f"  安全验证速度: {final_max_vel:.2f} m/s | 安全加速度: {final_max_acc:.2f} m/s²"
+                msg += f"  ⏳ 降速处理: 全局时间拉伸慢放 {s:.2f} 倍\n"
+            msg += f"  🛡️ 物理下发指标 -> 速度: {final_max_vel:.2f} m/s | 加速度: {final_max_acc:.2f} m/s²"
             
             return True, msg, csv_file, info
             
         except Exception as e:
             traceback.print_exc()
             return False, f"优化失败: {str(e)}", "", {}
-
-
+    
     @staticmethod
     def apply_physics_repulsion(df, safe_dist):
-        frames = df['Frame'].unique()
-        df_sorted = df.sort_values(by=['Frame', 'VertexID'])
+        """
+        动力学人工势场避障算法 (Kinematic APF with Damping & Curl Field)
+        """
+        df_sorted = df.sort_values(by=['Frame', 'Object', 'VertexID'])
+        frames = df_sorted['Frame'].unique()
         num_frames = len(frames)
         if num_frames == 0: return df
+
         frame0 = df_sorted[df_sorted['Frame'] == frames[0]]
         num_drones = len(frame0)
         
-        if len(df_sorted) != num_frames * num_drones: return df
+        if len(df_sorted) != num_frames * num_drones: 
+            return df
 
-        coords = df_sorted[['X', 'Y', 'Z']].values.reshape(num_frames, num_drones, 3)
-        iterations = 3; stiffness = 0.5 
-        for f in range(num_frames):
-            pts = coords[f]
-            for _ in range(iterations):
-                tree = cKDTree(pts); pairs = tree.query_pairs(r=safe_dist)
-                if not pairs: break
-                for i, j in pairs:
-                    p1 = pts[i]; p2 = pts[j]; vec = p1 - p2; dist = np.linalg.norm(vec)
-                    if dist < 1e-4: vec = np.random.rand(3) * 0.01; dist = 0.01
-                    push_amt = (safe_dist - dist) * 0.5 * stiffness; push_vec = (vec / dist) * push_amt
-                    pts[i] += push_vec; pts[j] -= push_vec
-            coords[f] = pts
-        df_sorted[['X', 'Y', 'Z']] = coords.reshape(-1, 3)
+        coords_target = df_sorted[['X', 'Y', 'Z']].values.reshape(num_frames, num_drones, 3)
+        coords_actual = np.zeros_like(coords_target)
+        
+        # ================= 核心物理系统参数配置 =================
+        dt = 1.0 / cfg.default_fps
+        k_attract = 12.0            # 目标引力系数
+        k_repel = 35.0              # 径向斥力系数 (防撞)
+        k_curl = 0               # [新增] 旋度场系数 (控制绕行侧滑的力度)
+        damping = 0.85              # 阻尼系数
+        # ========================================================
+
+        coords_actual[0] = coords_target[0].copy()
+        velocities = np.zeros((num_drones, 3))
+
+        for f in range(1, num_frames):
+            curr_pos = coords_actual[f-1].copy()
+            target_pos = coords_target[f]
+
+            F_attract = k_attract * (target_pos - curr_pos)
+            F_repel = np.zeros((num_drones, 3))
+            
+            tree = cKDTree(curr_pos)
+            defense_radius = safe_dist * 1.25 
+            pairs = tree.query_pairs(r=defense_radius)
+
+            z_axis = np.array([0.0, 0.0, 1.0]) # 垂直参考轴
+
+            for i, j in pairs:
+                vec = curr_pos[i] - curr_pos[j]
+                dist = np.linalg.norm(vec)
+                
+                if dist < 1e-4:
+                    vec = np.random.rand(3) * 0.01 - 0.005
+                    dist = np.linalg.norm(vec)
+
+                # 1. 基础径向斥力 (互相推开)
+                push_force = k_repel * (defense_radius - dist)
+                repel_vec = (vec / dist) * push_force
+
+                # 2. [新增] 旋度场切向力 (侧身绕行)
+                # 使用叉乘产生水平侧向引导力
+                curl_vec = np.cross(vec / dist, z_axis)
+                
+                # 极端情况保护：如果两架飞机恰好在垂直 Z 轴上绝对重合
+                if np.linalg.norm(curl_vec) < 1e-3:
+                    curl_vec = np.array([1.0, 0.0, 0.0]) # 强制给个X轴偏置
+                else:
+                    curl_vec = curl_vec / np.linalg.norm(curl_vec)
+
+                # 旋度力的大小与斥力成正比，距离越近，急转弯的力越大
+                curl_force = curl_vec * push_force * k_curl
+
+                # 3. 最终合力 = 推开 + 侧滑
+                total_force = repel_vec + curl_force
+
+                # 作用力与反作用力：对方受到相反的旋度力，形成太极双螺旋
+                F_repel[i] += total_force
+                F_repel[j] -= total_force
+
+            acceleration = F_attract + F_repel
+            velocities = velocities + acceleration * dt
+            velocities = velocities * damping
+            coords_actual[f] = curr_pos + velocities * dt
+
+        df_sorted[['X', 'Y', 'Z']] = coords_actual.reshape(-1, 3)
         return df_sorted
+
+    """ @staticmethod
+    def apply_physics_repulsion(df, safe_dist):
+        df_sorted = df.sort_values(by=['Frame', 'Object', 'VertexID'])
+        frames = df_sorted['Frame'].unique()
+        num_frames = len(frames)
+        if num_frames == 0: return df
+
+        frame0 = df_sorted[df_sorted['Frame'] == frames[0]]
+        num_drones = len(frame0)
+        
+        # 帧数和无人机数量匹配
+        if len(df_sorted) != num_frames * num_drones: 
+            return df
+
+        # 提取目标动画轨迹
+        coords_target = df_sorted[['X', 'Y', 'Z']].values.reshape(num_frames, num_drones, 3)
+        
+        # 创建飞行轨迹容器
+        coords_actual = np.zeros_like(coords_target)
+        
+        # 参数配置
+        dt = 1.0 / cfg.default_fps  # 物理仿真步长
+        k_attract = 12.0            # 目标引力系数
+        k_repel = 35.0              # 避障斥力系数
+        damping = 0.85              # 空气阻尼系数 (0~1)
+
+        # 初始状态
+        coords_actual[0] = coords_target[0].copy()
+        velocities = np.zeros((num_drones, 3))
+
+        for f in range(1, num_frames):
+            curr_pos = coords_actual[f-1].copy() # 当前真实的物理坐标
+            target_pos = coords_target[f]        # 动画驱动的虚拟目标坐标
+
+            # 1. 计算引力场 (Attraction Force)
+            F_attract = k_attract * (target_pos - curr_pos)
+
+            # 2. 计算斥力场 (Repulsion Force)
+            F_repel = np.zeros((num_drones, 3))
+            tree = cKDTree(curr_pos)
+            
+            defense_radius = safe_dist * 1.25 
+            pairs = tree.query_pairs(r=defense_radius)
+
+            for i, j in pairs:
+                vec = curr_pos[i] - curr_pos[j]
+                dist = np.linalg.norm(vec)
+                
+                if dist < 1e-4:
+                    vec = np.random.rand(3) * 0.01 - 0.005
+                    dist = np.linalg.norm(vec)
+
+                push_force = k_repel * (defense_radius - dist)
+                force_vec = (vec / dist) * push_force
+
+                F_repel[i] += force_vec
+                F_repel[j] -= force_vec
+
+            # 3. 运动学解算 
+            # 假设无人机质量 m=1.0，则 F = ma -> a = F
+            acceleration = F_attract + F_repel
+
+            # 4. 半隐式欧拉积分
+            velocities = velocities + acceleration * dt
+            
+            velocities = velocities * damping
+
+            # 更新下一帧的物理位置
+            coords_actual[f] = curr_pos + velocities * dt
+
+        # 实际坐标写回 DataFrame
+        df_sorted[['X', 'Y', 'Z']] = coords_actual.reshape(-1, 3)
+        return df_sorted """
+
 
     @staticmethod
     def smooth_trajectory_b_spline(df, dt_sample=0.02):
-        """重新以50Hz生成解析后的B样条平滑轨迹"""
         df = df.sort_values(by=['Object', 'VertexID', 'Frame'])
         frames = df['Frame'].unique()
         frames.sort()

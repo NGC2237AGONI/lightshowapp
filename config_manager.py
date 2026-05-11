@@ -5,7 +5,7 @@ from dataclasses import dataclass, asdict
 @dataclass
 class DroneConfig:
     #物理限制参数
-    max_accel: float = 4.0       # 最大安全加速度 (m/s^2)
+    max_accel: float = 7.0       # 最大安全加速度 (m/s^2)
     default_fps: int = 20        # 原始动画采样率
     high_density_fps: int = 50   # B样条插值后的高频采样率
     
@@ -33,7 +33,6 @@ class ConfigManager:
         if os.path.exists(self._config_file):
             with open(self._config_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                # 动态更新 dataclass
                 for k, v in data.items():
                     if hasattr(self.config, k):
                         setattr(self.config, k, v)
@@ -42,5 +41,4 @@ class ConfigManager:
         with open(self._config_file, 'w', encoding='utf-8') as f:
             json.dump(asdict(self.config), f, indent=4)
 
-# 全局单例引用
 cfg = ConfigManager().config

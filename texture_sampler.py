@@ -12,8 +12,7 @@ def build_texture_cache(root_dir):
     if root_dir in _TEXTURE_CACHE:
         return _TEXTURE_CACHE[root_dir]
     
-    # 这一句如果打印出来了，说明你用的是新代码
-    print(f"   [系统] 正在建立纹理索引: {root_dir}")
+    print(f"  正在建立纹理索引: {root_dir}")
     cache = {}
     valid_exts = {'.jpg', '.jpeg', '.png', '.tga', '.bmp', '.tif', '.tiff'}
     
@@ -22,7 +21,6 @@ def build_texture_cache(root_dir):
             ext = os.path.splitext(f)[1].lower()
             if ext in valid_exts:
                 full_path = os.path.join(root, f)
-                # 键只存小写的无后缀名，例如 "horse_diffuse"
                 basename = os.path.splitext(f)[0].lower() 
                 if basename not in cache:
                     cache[basename] = full_path
@@ -31,23 +29,18 @@ def build_texture_cache(root_dir):
     return cache
 
 def find_texture_smart(fbx_path, texture_name):
-    # 确定搜索根目录：FBX目录的上一级的上一级
     fbx_dir = os.path.dirname(os.path.abspath(fbx_path))
     search_root = os.path.dirname(fbx_dir)
-    if len(search_root) < 3: search_root = fbx_dir # 防御
+    if len(search_root) < 3: search_root = fbx_dir 
     
     cache = build_texture_cache(search_root)
     
-    # 目标文件名也去掉后缀
     target_basename = os.path.splitext(os.path.basename(texture_name))[0].lower()
     
-    # 1. 精确匹配 (忽略后缀)
     if target_basename in cache:
         print(f"   [纹理匹配] {texture_name} -> {os.path.basename(cache[target_basename])}")
         return cache[target_basename]
-        
-    # 2. 包含匹配 (应对 _CRS, _D 等后缀差异)
-    # 查找 cache 中是否包含 target_basename，或者反之
+
     for key, path in cache.items():
         if target_basename in key or key in target_basename:
             print(f"   [模糊匹配] {texture_name} -> {os.path.basename(path)}")
@@ -60,7 +53,6 @@ def get_texture_colors(mesh, node, base_path="."):
     default_color = (0.5, 0.5, 0.5)
     final_colors = [default_color] * num_verts
 
-    # 1. 寻找纹理名
     texture_fbx_path = None
     if node.GetMaterialCount() > 0:
         for m_idx in range(node.GetMaterialCount()):
@@ -78,14 +70,12 @@ def get_texture_colors(mesh, node, base_path="."):
     
     if not texture_fbx_path: return None 
 
-    # 2. 智能搜索
     real_image_path = find_texture_smart(os.path.join(base_path, "placeholder.fbx"), texture_fbx_path)
 
     if not real_image_path:
         print(f"   [警告] 找不到贴图: {os.path.basename(texture_fbx_path)} (智能搜索失败)")
         return None
 
-    # 3. 加载图片
     try:
         img = Image.open(real_image_path)
         if img.width > 1024 or img.height > 1024:

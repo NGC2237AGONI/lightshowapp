@@ -6,7 +6,7 @@ import traceback
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QLineEdit, QPushButton, QComboBox, QFileDialog, 
                              QGroupBox, QSpinBox, QDoubleSpinBox, QTextEdit, QMessageBox, QSplitter,
-                             QTabWidget, QListWidget, QListWidgetItem, QAbstractItemView)
+                             QTabWidget, QListWidget, QListWidgetItem, QAbstractItemView, QCheckBox)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
@@ -102,10 +102,17 @@ class MainWindow(QMainWindow):
         self.animations = [] 
         self.playing = False
         self.anim_frames = {}
+        self.frame_types = {}
         self.anim_timer = QTimer()
         self.anim_timer.timeout.connect(self.update_plot)
         self.current_frame = 0
         self.total_frames = 0
+        
+        self.current_play_time = 0.0 
+        self.times_array = np.array([])
+        self.frames_array = np.array([])
+        self.csv_max_time = 0.0
+        
         self.current_csv = ""
         
         self.scatter = None
@@ -129,7 +136,7 @@ class MainWindow(QMainWindow):
         
         self.tabs = QTabWidget()
         
-        # --- Tab 1: 静态处理 ---
+        # --- Tab 1: 静态预处理 ---
         tab1 = QWidget()
         tab1_layout = QVBoxLayout(tab1)
         
@@ -162,7 +169,7 @@ class MainWindow(QMainWindow):
         lay_count.addWidget(QLabel("目标数量:"))
         self.spin_count = QSpinBox()
         self.spin_count.setRange(10, 99999)
-        self.spin_count.setValue(600)
+        self.spin_count.setValue(100)
         lay_count.addWidget(self.spin_count)
         lay_opt.addLayout(lay_count)
         lay_axis = QHBoxLayout()
@@ -190,21 +197,25 @@ class MainWindow(QMainWindow):
         lay_config = QVBoxLayout()
         lay_safe_config = QHBoxLayout()
         lay_safe_config.addWidget(QLabel("最小安全距离(m):"))
-        self.spin_safe_config = QDoubleSpinBox(); self.spin_safe_config.setRange(0.1, 50.0); self.spin_safe_config.setValue(1.5)
+        self.spin_safe_config = QDoubleSpinBox(); self.spin_safe_config.setRange(0.1, 50.0); self.spin_safe_config.setValue(2)
         lay_safe_config.addWidget(self.spin_safe_config)
         lay_config.addLayout(lay_safe_config)
         
         lay_vel_config = QHBoxLayout()
         lay_vel_config.addWidget(QLabel("最大飞行速度(m/s):"))
         self.spin_max_vel = QDoubleSpinBox(); self.spin_max_vel.setRange(0.1, 100.0); self.spin_max_vel.setValue(8.0)
+        
+        # 【新增侦听器】：修改速度参数时，同步刷新节目单界面的极限计算
+        self.spin_max_vel.valueChanged.connect(self.on_max_vel_changed)
+        
         lay_vel_config.addWidget(self.spin_max_vel)
         lay_config.addLayout(lay_vel_config)
         
         lay_config.addWidget(QLabel("场地边界 (L x W x H):"))
         h4 = QHBoxLayout()
-        self.spin_L = QDoubleSpinBox(); self.spin_L.setRange(1, 9e6); self.spin_L.setValue(200); self.spin_L.setPrefix("L:")
-        self.spin_W = QDoubleSpinBox(); self.spin_W.setRange(1, 9e6); self.spin_W.setValue(200); self.spin_W.setPrefix("W:")
-        self.spin_H = QDoubleSpinBox(); self.spin_H.setRange(1, 9e6); self.spin_H.setValue(150); self.spin_H.setPrefix("H:")
+        self.spin_L = QDoubleSpinBox(); self.spin_L.setRange(1, 9e6); self.spin_L.setValue(500); self.spin_L.setPrefix("L:")
+        self.spin_W = QDoubleSpinBox(); self.spin_W.setRange(1, 9e6); self.spin_W.setValue(500); self.spin_W.setPrefix("W:")
+        self.spin_H = QDoubleSpinBox(); self.spin_H.setRange(1, 9e6); self.spin_H.setValue(300); self.spin_H.setPrefix("H:")
         
         self.spin_L.valueChanged.connect(self.refresh_scene_if_needed)
         self.spin_W.valueChanged.connect(self.refresh_scene_if_needed)
@@ -250,16 +261,29 @@ class MainWindow(QMainWindow):
         grp_verify = QGroupBox("5. 验证与播放")
         lay_verify = QVBoxLayout()
         
-        # =================【新增 UI 控件】=================
         self.lbl_final_dur = QLabel("最终物理执行时长: - s")
         self.lbl_final_dur.setStyleSheet("color: #FF5722; font-weight: bold;")
         lay_verify.addWidget(self.lbl_final_dur)
         
-        self.combo_play_speed = QComboBox()
-        self.combo_play_speed.addItems(["真实物理速度", "设计原速动画预览"])
-        lay_verify.addWidget(self.combo_play_speed)
-        self.current_time_scale = 1.0 # 初始化拉伸系数记录
-        # ================================================
+        lay_speed = QHBoxLayout()
+        lay_speed.addWidget(QLabel("全局倍速:"))
+        self.spin_speed = QDoubleSpinBox()
+        self.spin_speed.setRange(0.1, 50.0)
+        self.spin_speed.setValue(1.0)
+        self.spin_speed.setSingleStep(0.5)
+        lay_speed.addWidget(self.spin_speed)
+        
+        lay_speed.addWidget(QLabel("动画抗拉伸:"))
+        self.spin_anim_speed = QDoubleSpinBox()
+        self.spin_anim_speed.setRange(1.0, 50.0)
+        self.spin_anim_speed.setValue(1.0)
+        self.spin_anim_speed.setSingleStep(0.5)
+        self.spin_anim_speed.setStyleSheet("color: #FF5722; font-weight: bold;")
+        self.spin_anim_speed.setToolTip("仅加速表演段，抵消安全拉伸。生成时会自动填入拉伸倍数。")
+        lay_speed.addWidget(self.spin_anim_speed)
+        lay_verify.addLayout(lay_speed)
+        
+        self.current_time_scale = 1.0
 
         self.btn_analyze = QPushButton(" 安全性体检")
         self.btn_analyze.clicked.connect(self.run_safety_check)
@@ -269,6 +293,15 @@ class MainWindow(QMainWindow):
         self.btn_play = QPushButton(" 播放/暂停")
         self.btn_play.clicked.connect(self.toggle_play)
         
+        self.check_show_scales = QCheckBox("显示刻度")
+        self.check_show_scales.setChecked(True) 
+        self.check_show_scales.setStyleSheet("""
+            QCheckBox { color: #AAAAAA; font-size: 9pt; }
+            QCheckBox::indicator { width: 12px; height: 12px; background-color: #333; border: 1px solid #666; }
+            QCheckBox::indicator:checked { background-color: #EEE; border: 1px solid #FFF; }
+        """)
+        self.check_show_scales.stateChanged.connect(self.refresh_scene_if_needed)
+
         self.spin_pt = QSpinBox()
         self.spin_pt.setValue(5)
         self.spin_pt.valueChanged.connect(self.update_point_size)
@@ -276,6 +309,7 @@ class MainWindow(QMainWindow):
         lay_play_ctrl.addWidget(self.btn_play)
         lay_play_ctrl.addWidget(self.spin_pt)
         lay_verify.addLayout(lay_play_ctrl)
+        lay_play_ctrl.addWidget(self.check_show_scales)
         grp_verify.setLayout(lay_verify)
 
         tab2_layout.addWidget(grp_config); tab2_layout.addWidget(grp_anim); tab2_layout.addWidget(grp_verify); tab2_layout.addStretch()
@@ -298,7 +332,6 @@ class MainWindow(QMainWindow):
         h_comp_btns.addWidget(self.btn_add_csv); h_comp_btns.addWidget(self.btn_remove_csv)
         lay_comp_list.addLayout(h_comp_btns)
         
-        # 第一行：过渡时间
         h_trans = QHBoxLayout()
         h_trans.addWidget(QLabel("过渡(s):"))
         self.spin_trans_dur = QDoubleSpinBox(); self.spin_trans_dur.setValue(5.0)
@@ -307,7 +340,6 @@ class MainWindow(QMainWindow):
         h_trans.addStretch()
         lay_comp_list.addLayout(h_trans)
         
-        # 第二行：自转设置
         h_rot = QHBoxLayout()
         h_rot.addWidget(QLabel("自转(XYZ):"))
         self.spin_rot_x = QDoubleSpinBox(); self.spin_rot_x.setRange(-360, 360)
@@ -318,8 +350,7 @@ class MainWindow(QMainWindow):
         self.spin_rot_z.valueChanged.connect(self.update_comp_params)
         h_rot.addWidget(self.spin_rot_x); h_rot.addWidget(self.spin_rot_y); h_rot.addWidget(self.spin_rot_z)
         lay_comp_list.addLayout(h_rot)
-        
-        # 【新增】第三行：位移设置
+    
         h_pos = QHBoxLayout()
         h_pos.addWidget(QLabel("位移(XYZ):"))
         self.spin_pos_x = QDoubleSpinBox(); self.spin_pos_x.setRange(-9999, 9999)
@@ -348,7 +379,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(tab3, "3. 编队合成")
         left_layout.addWidget(self.tabs)
         
-        # Right Panel
+        # --- Right Panel ---
         right_panel = QWidget(); right_layout = QVBoxLayout(right_panel)
         self.fig = Figure(figsize=(5, 5), dpi=100, facecolor='black')
         self.canvas = FigureCanvas(self.fig)
@@ -367,12 +398,18 @@ class MainWindow(QMainWindow):
         self.log_box.append(msg)
         QApplication.processEvents()
 
-    # (其他函数保持不变...)
     def reset_all_state(self):
         self.playing = False
         self.anim_timer.stop()
         self.anim_frames = {}
+        self.frame_types = {}
         self.current_frame = 0
+        
+        self.current_play_time = 0.0 
+        self.times_array = np.array([])
+        self.frames_array = np.array([])
+        self.csv_max_time = 0.0
+        
         self.current_static_pts = None
         self.current_static_cols = None
         if self.scatter: self.scatter.remove(); self.scatter = None
@@ -382,8 +419,8 @@ class MainWindow(QMainWindow):
 
     def run_optimize(self):
         self.btn_optimize.setEnabled(False)
-        self.btn_optimize.setText("计算中...请稍候")
-        self.log(" 后台开始计算编队...")
+        self.btn_optimize.setText("计算中")
+        self.log(" 后台开始计算编队")
         
         self.worker = OptimizationWorker(
             self.optimizer,
@@ -396,7 +433,7 @@ class MainWindow(QMainWindow):
 
     def on_optimize_finished(self, success, msg, pts, cols):
         self.btn_optimize.setEnabled(True)
-        self.btn_optimize.setText("生成静态编队 (预览)")
+        self.btn_optimize.setText("生成静态编队预览")
         self.log(msg)
         if success:
             self.current_static_pts = pts
@@ -411,21 +448,56 @@ class MainWindow(QMainWindow):
         else: self.setup_scene(mode='box')
 
     def setup_scene(self, mode='auto'):
-        if self.ax is None: return 
-        self.ax.clear(); self.ax.set_facecolor('black'); self.ax.axis('off')
+        if self.ax is None: return
+        self.ax.clear()
+        self.ax.set_facecolor('black')
+
         if mode == 'box':
-            try:
-                L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
-                axis_len = max(L, W, H) * 0.1
-                self.ax.plot([0, axis_len], [0, 0], [0, 0], color='red')
-                self.ax.plot([0, 0], [0, axis_len], [0, 0], color='green')
-                self.ax.plot([0, 0], [0, 0], [0, axis_len], color='blue')
-                min_x, max_x = -L/2, L/2; min_y, max_y = -W/2, W/2; min_z, max_z = 0, H
-                corners = np.array([[min_x, min_y, min_z], [max_x, min_y, min_z], [max_x, max_y, min_z], [min_x, max_y, min_z], [min_x, min_y, max_z], [max_x, min_y, max_z], [max_x, max_y, max_z], [min_x, max_y, max_z]])
-                edges = [(0,1), (1,2), (2,3), (3,0), (4,5), (5,6), (6,7), (7,4), (0,4), (1,5), (2,6), (3,7)]
-                for s, e in edges: self.ax.plot3D([corners[s][0], corners[e][0]], [corners[s][1], corners[e][1]], [corners[s][2], corners[e][2]], color='gray', linestyle='--', alpha=0.5)
-                self.ax.set_xlim(min_x, max_x); self.ax.set_ylim(min_y, max_y); self.ax.set_zlim(min_z, max_z); self.ax.set_box_aspect((L, W, H))
-            except: pass
+            if hasattr(self, 'check_show_scales') and self.check_show_scales.isChecked():
+                self.ax.set_axis_on() 
+                try:
+                    L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+                    min_x, max_x = -L/2, L/2
+                    min_y, max_y = -W/2, W/2
+                    min_z, max_z = 0, H
+
+                    self.ax.set_xlim(min_x, max_x)
+                    self.ax.set_ylim(min_y, max_y)
+                    self.ax.set_zlim(min_z, max_z)
+                    self.ax.set_box_aspect((L, W, H))
+
+                    self.ax.set_xlabel('X (m)', color='#666', fontsize=8)
+                    self.ax.set_ylabel('Y (m)', color='#666', fontsize=8)
+                    self.ax.set_zlabel('Z (m)', color='#666', fontsize=8)
+                    self.ax.tick_params(colors='#888', labelsize=7)
+
+                    self.ax.xaxis.set_pane_color((0,0,0,0))
+                    self.ax.yaxis.set_pane_color((0,0,0,0))
+                    self.ax.zaxis.set_pane_color((0,0,0,0))
+                    grid_style = {"color": "gray", "linestyle": "--", "linewidth": 0.3, "alpha": 0.4}
+                    self.ax.xaxis._axinfo["grid"].update(grid_style)
+                    self.ax.yaxis._axinfo["grid"].update(grid_style)
+                    self.ax.zaxis._axinfo["grid"].update(grid_style)
+                    
+                    xx, yy = np.meshgrid(np.linspace(min_x, max_x, 2), np.linspace(min_y, max_y, 2))
+                    zz = np.zeros_like(xx)
+                    self.ax.plot_surface(xx, yy, zz, color='#00FF00', alpha=0.1, shade=False)
+                    self.ax.plot([min_x, max_x, max_x, min_x, min_x], 
+                                 [min_y, min_y, max_y, max_y, min_y], 
+                                 [0, 0, 0, 0, 0], color='#00AA00', alpha=0.5, linewidth=2)
+                except: pass
+            else:
+                self.ax.set_axis_off()
+            
+            L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+            axis_len = max(L, W, H) * 0.05
+            self.ax.plot([0, axis_len], [0, 0], [0, 0], color='#ff4444', alpha=0.8)
+            self.ax.plot([0, 0], [0, axis_len], [0, 0], color='#44ff44', alpha=0.8)
+            self.ax.plot([0, 0], [0, 0], [0, axis_len], color='#4444ff', alpha=0.8)
+
+        else:
+            self.ax.axis('off') 
+
         self.scatter = self.ax.scatter([], [], [], c=[], s=self.spin_pt.value())
         self.canvas.draw()
 
@@ -457,7 +529,7 @@ class MainWindow(QMainWindow):
             sug_L = curr_L * ratio * 1.1; sug_W = curr_W * ratio * 1.1; sug_H = curr_H * ratio * 1.1
             self.log("-" * 35)
             self.log(f" 智能场地建议: 目标 {safe_dist}m, 当前 {avg_neighbor_dist:.2f}m")
-            if ratio > 1.0: self.log(f"    建议放大 {ratio:.2f} 倍 -> {sug_L:.1f}x{sug_W:.1f}x{sug_H:.1f}")
+            if ratio > 1.0: self.log(f" 建议放大 {ratio:.2f} 倍 -> {sug_L:.1f}x{sug_W:.1f}x{sug_H:.1f}")
             else: self.log(f"    当前尺寸合适")
             self.log("-" * 35)
         except Exception as e: print(e)
@@ -491,7 +563,7 @@ class MainWindow(QMainWindow):
         save_path, _ = QFileDialog.getSaveFileName(self, "保存轨迹", default_name, "CSV Files (*.csv)")
         if not save_path: return
 
-        self.btn_export.setEnabled(False); self.btn_export.setText(" 正在导出...")
+        self.btn_export.setEnabled(False); self.btn_export.setText(" 正在导出")
         self.log(f"开始导出: {os.path.basename(save_path)}")
         L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
         
@@ -510,8 +582,9 @@ class MainWindow(QMainWindow):
         if success:
             self.current_csv = path
             
-            # 【新增】记录缩放系数，更新最终执行时长
             self.current_time_scale = info.get('time_scale', 1.0)
+            self.spin_anim_speed.setValue(self.current_time_scale)
+            
             raw_time_str = self.lbl_raw_dur.text().split(' ')[0]
             try:
                 final_time = float(raw_time_str) * self.current_time_scale
@@ -519,11 +592,26 @@ class MainWindow(QMainWindow):
             except: pass
             
             self.load_csv_for_play()
-            QMessageBox.information(self, "成功", f"导出成功！\n文件: {path}")
+            QMessageBox.information(self, "成功", f"导出成功\n文件: {path}")
 
     def run_safety_check(self):
-        if not self.current_csv: return self.log("请先生成轨迹")
-        self.log(" 安全分析..."); safety_analyzer.analyze_safety(csv_file=self.current_csv, safe_distance=self.spin_safe_config.value(), max_velocity=self.spin_max_vel.value()); self.log("✅ 图表已生成")
+        if not self.current_csv: 
+            return self.log("请先生成轨迹")
+            
+        self.log(" 开始生成安全分析报告...")
+        
+        safety_analyzer.analyze_safety(
+            csv_file=self.current_csv, 
+            safe_distance=self.spin_safe_config.value(), 
+            max_velocity=self.spin_max_vel.value()
+        )
+        
+        safety_analyzer.generate_peak_velocity_distribution(
+        csv_file=self.current_csv, 
+        max_velocity=self.spin_max_vel.value()
+        )
+        
+        self.log("✅ 图表已生成 safety_report.png 和 velocity_distribution_3d.png")
 
     def plot_static_memory(self, pts, cols, force_mode=None):
         try:
@@ -539,38 +627,76 @@ class MainWindow(QMainWindow):
 
     def load_csv_for_play(self, csv_file=None):
         if csv_file: self.current_csv = csv_file
-        self.log(f"加载播放: {self.current_csv}"); self.anim_frames = {}; all_pos = []
+        self.log(f"加载播放: {self.current_csv}")
+        self.anim_frames = {}
+        self.frame_types = {}
+        time_map = {} 
+        
         try:
             with open(self.current_csv, 'r') as f:
-                reader = csv.reader(f); next(reader)
+                reader = csv.reader(f)
+                next(reader)
                 for row in reader:
-                    f_idx = int(row[0]); x,y,z = float(row[4]), float(row[5]), float(row[6]); r,g,b = float(row[7])/255, float(row[8])/255, float(row[9])/255
-                    if f_idx not in self.anim_frames: self.anim_frames[f_idx] = []
+                    f_idx = int(row[0])
+                    t_val = float(row[1]) 
+                    obj_name = row[2]
+                    
+                    x,y,z = float(row[4]), float(row[5]), float(row[6])
+                    r,g,b = float(row[7])/255, float(row[8])/255, float(row[9])/255
+                    
+                    if f_idx not in self.anim_frames: 
+                        self.anim_frames[f_idx] = []
+                        time_map[f_idx] = t_val 
+                        self.frame_types[f_idx] = obj_name.startswith("Sys_")
+                        
                     self.anim_frames[f_idx].append([x,y,z,r,g,b])
-            self.total_frames = len(self.anim_frames); self.current_frame = 0; 
+            
+            sorted_frames = sorted(time_map.keys())
+            self.frames_array = np.array(sorted_frames)
+            self.times_array = np.array([time_map[f] for f in sorted_frames])
+            
+            self.csv_max_time = self.times_array[-1] if len(self.times_array) > 0 else 0.0
+            self.current_play_time = 0.0 
+            self.current_frame = self.frames_array[0] if len(self.frames_array) > 0 else 0
+            
             if self.tabs.currentIndex() == 0: self.tabs.setCurrentIndex(1)
             self.setup_scene(mode='box')
-            self.playing = True; self.anim_timer.start(50)
-        except Exception as e: self.log(f"加载失败: {e}")
+            self.playing = True
+            self.anim_timer.start(50)
+        except Exception as e: 
+            self.log(f"加载失败: {e}")
+            traceback.print_exc()
 
     def toggle_play(self): self.playing = not self.playing; self.anim_timer.start() if self.playing else self.anim_timer.stop()
     def update_point_size(self): 
         if self.scatter: self.scatter.set_sizes([self.spin_pt.value()]); self.canvas.draw()
+        
     def update_plot(self):
-        if not self.anim_frames: return
+        if not self.anim_frames or len(self.times_array) == 0: return
         try:
-            data = np.array(self.anim_frames.get(self.current_frame,[]))
+            data = np.array(self.anim_frames.get(self.current_frame, []))
             if len(data) > 0:
                 self.scatter._offsets3d = (data[:,0], data[:,1], data[:,2])
                 self.scatter.set_color(data[:,3:])
                 self.scatter.set_sizes([self.spin_pt.value()])
             
-                step = 1
-                if self.combo_play_speed.currentIndex() == 1: 
-                    step = max(1, int(self.current_time_scale))
-                    
-                self.current_frame = (self.current_frame + step) % self.total_frames
-                self.canvas.draw()
+            timer_dt = 0.05 
+            multiplier = self.spin_speed.value()
+            
+            is_sys_frame = self.frame_types.get(self.current_frame, False)
+            if not is_sys_frame:
+                multiplier *= self.spin_anim_speed.value()
+            
+            self.current_play_time += timer_dt * multiplier
+            
+            if self.current_play_time > self.csv_max_time:
+                self.current_play_time = 0.0
+                
+            idx = np.searchsorted(self.times_array, self.current_play_time, side='right') - 1
+            if idx < 0: idx = 0
+            
+            self.current_frame = self.frames_array[idx]
+            self.canvas.draw()
         except: pass
 
     # --- Tab 3: List handling ---
@@ -580,15 +706,20 @@ class MainWindow(QMainWindow):
             ok, msg = self.composer.add_file(fname)
             if ok: self.log(msg); self.refresh_list()
             else: self.log(f" {msg}")
+            
     def remove_comp_file(self):
         row = self.list_widget.currentRow()
         if row >= 0: self.composer.remove_file(row); self.refresh_list()
     
+    def on_max_vel_changed(self):
+        row = self.list_widget.currentRow()
+        if row >= 0:
+            self.on_list_item_clicked(self.list_widget.item(row))
+            
     def on_list_item_clicked(self, item):
         row = self.list_widget.row(item)
         if row >= 0 and row < len(self.composer.playlist):
             data = self.composer.playlist[row]
-            # 阻断信号
             self.spin_trans_dur.blockSignals(True)
             self.spin_rot_x.blockSignals(True)
             self.spin_rot_y.blockSignals(True)
@@ -597,17 +728,27 @@ class MainWindow(QMainWindow):
             self.spin_pos_y.blockSignals(True)
             self.spin_pos_z.blockSignals(True)
             
-            self.spin_trans_dur.setValue(data.get('transition_dur', 5.0))
-            rot = data.get('rotation', [0,0,0])
-            self.spin_rot_x.setValue(rot[0])
-            self.spin_rot_y.setValue(rot[1])
-            self.spin_rot_z.setValue(rot[2])
-            pos = data.get('position', [0,0,0])
-            self.spin_pos_x.setValue(pos[0])
-            self.spin_pos_y.setValue(pos[1])
-            self.spin_pos_z.setValue(pos[2])
+            self.spin_rot_x.setValue(data.get('rotation', [0,0,0])[0])
+            self.spin_rot_y.setValue(data.get('rotation', [0,0,0])[1])
+            self.spin_rot_z.setValue(data.get('rotation', [0,0,0])[2])
+            self.spin_pos_x.setValue(data.get('position', [0,0,0])[0])
+            self.spin_pos_y.setValue(data.get('position', [0,0,0])[1])
+            self.spin_pos_z.setValue(data.get('position', [0,0,0])[2])
             
-            # 恢复信号
+            L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+            if row < len(self.composer.playlist) - 1:
+                # 动态获取 UI 设定的物理极速传入
+                min_t = self.composer.get_min_safe_transition_time(row, (L, W, H), self.spin_max_vel.value())
+                self.spin_trans_dur.setMinimum(min_t) 
+                self.spin_trans_dur.setEnabled(True)
+                self.spin_trans_dur.setToolTip(f"受物理动力学限制，当前幕间过渡时间被锁死，最短不能低于 {min_t}s")
+            else:
+                self.spin_trans_dur.setMinimum(0.0)
+                self.spin_trans_dur.setEnabled(False) 
+                self.spin_trans_dur.setToolTip("节目结束，无过渡")
+
+            self.spin_trans_dur.setValue(data.get('transition_dur', 5.0))
+            
             self.spin_trans_dur.blockSignals(False)
             self.spin_rot_x.blockSignals(False)
             self.spin_rot_y.blockSignals(False)
@@ -619,9 +760,18 @@ class MainWindow(QMainWindow):
     def update_comp_params(self):
         row = self.list_widget.currentRow()
         if row >= 0:
-            self.composer.set_transition_duration(row, self.spin_trans_dur.value())
             self.composer.set_rotation(row, self.spin_rot_x.value(), self.spin_rot_y.value(), self.spin_rot_z.value())
             self.composer.set_position(row, self.spin_pos_x.value(), self.spin_pos_y.value(), self.spin_pos_z.value())
+            
+            L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
+            if row < len(self.composer.playlist) - 1:
+                min_t = self.composer.get_min_safe_transition_time(row, (L, W, H), self.spin_max_vel.value())
+                self.spin_trans_dur.blockSignals(True)
+                self.spin_trans_dur.setMinimum(min_t)
+                self.spin_trans_dur.setToolTip(f"受物理动力学限制，当前幕间过渡时间被锁死，最短不能低于 {min_t}s")
+                self.spin_trans_dur.blockSignals(False)
+            
+            self.composer.set_transition_duration(row, self.spin_trans_dur.value())
             self.refresh_list()
             self.list_widget.setCurrentRow(row)
 
@@ -632,7 +782,6 @@ class MainWindow(QMainWindow):
             dur = item['transition_dur']
             rot = item.get('rotation', [0,0,0])
             pos = item.get('position', [0,0,0])
-            # 显示更详细的信息
             txt = f"[{i+1}] {name}\n    Rot:{rot} | Pos:{pos}"
             if i < len(self.composer.playlist) - 1:
                 txt += f"\n    ( ↘ 过渡: {dur}s ↘ )"
@@ -645,11 +794,13 @@ class MainWindow(QMainWindow):
         save_path, _ = QFileDialog.getSaveFileName(self, "保存合成文件", "Full_Show.csv", "CSV Files (*.csv)")
         if not save_path: return
         
-        # 获取场地边界传递给后台
         L, W, H = self.spin_L.value(), self.spin_W.value(), self.spin_H.value()
         
         self.log(" 开始合成 ..."); QApplication.processEvents()
-        ok, msg = self.composer.merge_shows(save_path, self.spin_safe_config.value(), (L, W, H))
+        
+        # 将 UI 中设定的物理极速传入底层计算引擎
+        ok, msg = self.composer.merge_shows(save_path, self.spin_safe_config.value(), (L, W, H), self.spin_max_vel.value())
+        
         self.log(msg)
         if ok: self.current_csv = save_path; self.load_csv_for_play()
 
